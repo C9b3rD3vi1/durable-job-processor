@@ -2,12 +2,13 @@
 
 A fault-tolerant background job processing system built with Go and PostgreSQL.
 
-**Phase 2 is implemented:** bounded workers now claim queued jobs atomically,
-execute typed handlers and record fenced lifecycle transitions. Phase 1 remains
-the durable submission and retrieval layer. Heartbeats, expired-lease recovery,
-richer retry classification and observability are planned for later phases.
+**Phases 1–3 are implemented:** durable submission and retrieval, a worker that
+executes typed handlers, and bounded concurrent claiming across workers. Jobs
+move through fenced lifecycle transitions backed by PostgreSQL. Heartbeats,
+expired-lease recovery, richer retry classification and observability are planned
+for later phases.
 
-## What works in Phase 2
+## What works in Phase 2–3
 
 - A separate `cmd/worker` binary shares the PostgreSQL store with the API.
 - A handler registry maps each allow-listed job type to an executable handler;
@@ -17,7 +18,8 @@ richer retry classification and observability are planned for later phases.
 - Lifecycle transitions from `queued`/`retry_wait` to `running`, then to
   `succeeded`, `retry_wait` or terminal `dead`.
 - Bounded concurrency: `WORKER_CONCURRENCY` independent claim loops, each
-  processing one job at a time.
+  processing one job at a time, so multiple workers and multiple processes can
+  share the queue without duplicate active claims.
 - Per-handler timeouts, panic recovery and fenced completion/failure writes.
 - Graceful shutdown stops claiming immediately, drains in-flight handlers for
   `SHUTDOWN_TIMEOUT`, then cancels their contexts.
@@ -132,7 +134,7 @@ Supported job types and their built-in handlers:
 The API rejects a job type that has no registered handler, so the allow-list and
 the worker dispatch table cannot drift.
 
-> **Identity note:** `X-Tenant-ID` is a Phase 1 development boundary. The
+> **Identity note:** `X-Tenant-ID` is a development boundary. The
 > architecture requires deriving tenancy from verified authentication claims.
 > Replace this header with authentication in Phase 6; never trust tenant IDs from
 > request payloads.
@@ -190,7 +192,7 @@ records a retry for work that could not finish.
 | `DB_MAX_CONNS` | `10` | Maximum pool connections |
 | `DB_MIN_CONNS` | `0` | Minimum pool connections |
 | `DB_CONNECT_TIMEOUT` | `5s` | Connection/ping timeout |
-| `AUTO_MIGRATE` | `false` | Apply migrations on API startup |
+| `AUTO_MIGRATE` | `false` | Apply migrations on API or worker startup |
 | `SHUTDOWN_TIMEOUT` | `15s` | Graceful shutdown budget for API and worker |
 | `WORKER_CONCURRENCY` | `4` | Maximum jobs a worker executes simultaneously |
 | `POLL_INTERVAL` | `1s` | Delay between claim attempts when no job is ready |
@@ -247,9 +249,9 @@ The integration suite verifies:
 - handlers move jobs through success, retry and dead-letter states;
 - worker concurrency stays bounded and graceful shutdown drains in flight work.
 
-Phase 2 claim tests run in throwaway PostgreSQL schemas, so they do not depend on
-or disturb development data. Integration tests are skipped when no
-`TEST_DATABASE_URL` or `DATABASE_URL` is set.
+Phase 2–3 claim and concurrency tests run in throwaway PostgreSQL schemas, so
+they do not depend on or disturb development data. Integration tests are skipped
+when no `TEST_DATABASE_URL` or `DATABASE_URL` is set.
 
 ## Project layout
 
@@ -276,7 +278,7 @@ docs/architecture/       Architecture blueprint and diagrams
 |---|---|
 | 1 — Job submission and persistence | Implemented |
 | 2 — First worker | Implemented |
-| 3 — Concurrency and bounded pool | Planned |
+| 3 — Concurrency and bounded pool | Implemented with Phase 2 |
 | 4 — Leases, heartbeat and recovery | Planned |
 | 5 — Retry and dead-letter | Planned |
 | 6 — Authentication and tenant hardening | Planned |
