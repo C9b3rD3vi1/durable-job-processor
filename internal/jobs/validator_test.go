@@ -13,7 +13,7 @@ import (
 )
 
 func testValidator() *Validator {
-	return NewValidator(handlers.NewRegistry("report.generate", "email.send"), 64, 5)
+	return NewValidator(handlers.DefaultRegistry(), 64, 5)
 }
 
 func validInput() SubmitInput {

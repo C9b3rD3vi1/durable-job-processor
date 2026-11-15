@@ -23,6 +23,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("POLL_INTERVAL", "750ms")
 	t.Setenv("LEASE_DURATION", "90s")
 	t.Setenv("HEARTBEAT_INTERVAL", "10s")
+	t.Setenv("HANDLER_TIMEOUT", "45s")
+	t.Setenv("RETRY_BASE_DELAY", "4s")
 	t.Setenv("MAX_ATTEMPTS", "7")
 	t.Setenv("MAX_PAYLOAD_BYTES", "1024")
 }
@@ -55,6 +57,9 @@ func TestLoad(t *testing.T) {
 	}
 	if cfg.LeaseDuration != 90*time.Second || cfg.HeartbeatInterval != 10*time.Second {
 		t.Errorf("lease config = %v/%v, want 90s/10s", cfg.LeaseDuration, cfg.HeartbeatInterval)
+	}
+	if cfg.HandlerTimeout != 45*time.Second || cfg.RetryBaseDelay != 4*time.Second {
+		t.Errorf("handler config = %v/%v, want 45s/4s", cfg.HandlerTimeout, cfg.RetryBaseDelay)
 	}
 	if cfg.MaxAttempts != 7 || cfg.MaxPayloadBytes != 1024 {
 		t.Errorf("limits = %d/%d, want 7/1024", cfg.MaxAttempts, cfg.MaxPayloadBytes)
@@ -91,6 +96,24 @@ func TestLoadRejectsUnsafeLease(t *testing.T) {
 	setBaseEnv(t)
 	t.Setenv("LEASE_DURATION", "10s")
 	t.Setenv("HEARTBEAT_INTERVAL", "10s")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want error")
+	}
+}
+
+func TestLoadRejectsHandlerTimeoutBeyondLease(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("HANDLER_TIMEOUT", "91s")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want error")
+	}
+}
+
+func TestLoadRejectsNonPositiveRetryDelay(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("RETRY_BASE_DELAY", "0s")
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("Load() error = nil, want error")

@@ -19,6 +19,8 @@ const (
 	defaultPollInterval      = time.Second
 	defaultLeaseDuration     = 60 * time.Second
 	defaultHeartbeatInterval = 15 * time.Second
+	defaultHandlerTimeout    = 30 * time.Second
+	defaultRetryBaseDelay    = 5 * time.Second
 	defaultMaxPayloadBytes   = 256 * 1024
 )
 
@@ -41,6 +43,8 @@ type Config struct {
 	PollInterval      time.Duration
 	LeaseDuration     time.Duration
 	HeartbeatInterval time.Duration
+	HandlerTimeout    time.Duration
+	RetryBaseDelay    time.Duration
 	MaxAttempts       int
 	MaxPayloadBytes   int64
 }
@@ -90,6 +94,12 @@ func Load() (Config, error) {
 	if cfg.HeartbeatInterval, err = envDuration("HEARTBEAT_INTERVAL", defaultHeartbeatInterval); err != nil {
 		return Config{}, err
 	}
+	if cfg.HandlerTimeout, err = envDuration("HANDLER_TIMEOUT", defaultHandlerTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.RetryBaseDelay, err = envDuration("RETRY_BASE_DELAY", defaultRetryBaseDelay); err != nil {
+		return Config{}, err
+	}
 	if cfg.WorkerConcurrency, err = envInt("WORKER_CONCURRENCY", defaultWorkerConcurrency); err != nil {
 		return Config{}, err
 	}
@@ -121,6 +131,15 @@ func Load() (Config, error) {
 	}
 	if cfg.LeaseDuration <= cfg.HeartbeatInterval {
 		return Config{}, fmt.Errorf("LEASE_DURATION must be greater than HEARTBEAT_INTERVAL")
+	}
+	if cfg.HandlerTimeout <= 0 {
+		return Config{}, fmt.Errorf("HANDLER_TIMEOUT must be positive")
+	}
+	if cfg.HandlerTimeout > cfg.LeaseDuration {
+		return Config{}, fmt.Errorf("HANDLER_TIMEOUT must not exceed LEASE_DURATION")
+	}
+	if cfg.RetryBaseDelay <= 0 {
+		return Config{}, fmt.Errorf("RETRY_BASE_DELAY must be positive")
 	}
 	if cfg.MaxAttempts < 1 || cfg.MaxAttempts > domain.MaxAttemptsLimit {
 		return Config{}, fmt.Errorf("MAX_ATTEMPTS must be between 1 and %d", domain.MaxAttemptsLimit)

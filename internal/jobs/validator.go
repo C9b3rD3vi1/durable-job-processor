@@ -9,11 +9,15 @@ import (
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
-	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
 	"github.com/google/uuid"
 )
 
 var jobTypePattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,99}$`)
+
+// JobTypeRegistry reports which job types have registered handlers.
+type JobTypeRegistry interface {
+	Allows(jobType string) bool
+}
 
 // SubmitInput is the transport-independent input for submitting a job.
 type SubmitInput struct {
@@ -28,15 +32,15 @@ type SubmitInput struct {
 
 // Validator turns caller input into a valid queued domain job.
 type Validator struct {
-	registry           *handlers.Registry
+	registry           JobTypeRegistry
 	maxPayloadBytes    int64
 	defaultMaxAttempts int
 }
 
 // NewValidator creates a validator with explicit limits.
-func NewValidator(registry *handlers.Registry, maxPayloadBytes int64, defaultMaxAttempts int) *Validator {
+func NewValidator(registry JobTypeRegistry, maxPayloadBytes int64, defaultMaxAttempts int) *Validator {
 	if registry == nil {
-		registry = handlers.NewRegistry()
+		registry = emptyRegistry{}
 	}
 	if maxPayloadBytes <= 0 {
 		maxPayloadBytes = 256 * 1024
@@ -50,6 +54,10 @@ func NewValidator(registry *handlers.Registry, maxPayloadBytes int64, defaultMax
 		defaultMaxAttempts: defaultMaxAttempts,
 	}
 }
+
+type emptyRegistry struct{}
+
+func (emptyRegistry) Allows(string) bool { return false }
 
 // Build validates input and returns a new queued job. The supplied now value is
 // used when no run_at is provided.

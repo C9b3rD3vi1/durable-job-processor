@@ -1,55 +1,92 @@
+// Package handlers maps allow-listed job types to execution handlers.
 package handlers
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 )
 
-// Registry is an allow-list of supported job types. Phase 1 uses it to reject
-// unknown job types before a row is written. Concrete handlers will be bound to
-// these type names in Phase 2.
+// ErrHandlerRegistered indicates that a job type already has a handler.
+var ErrHandlerRegistered = errors.New("handler already registered")
+
+// Handler executes one job type. Handlers must be safe for at-least-once
+// execution and must honour context cancellation.
+type Handler interface {
+	Execute(ctx context.Context, job domain.Job) (json.RawMessage, error)
+}
+
+// HandlerFunc adapts a function to the Handler interface.
+type HandlerFunc func(ctx context.Context, job domain.Job) (json.RawMessage, error)
+
+// Execute calls f.
+func (f HandlerFunc) Execute(ctx context.Context, job domain.Job) (json.RawMessage, error) {
+	return f(ctx, job)
+}
+
+// Registry is both the submission allow-list and the worker dispatch table.
+// A job type is accepted by the API only when a handler is registered for it.
 type Registry struct {
-	allowed map[string]struct{}
+	handlers map[string]Handler
 }
 
-// NewRegistry builds an allow-list from the supplied job type names.
-func NewRegistry(jobTypes ...string) *Registry {
-	r := &Registry{allowed: make(map[string]struct{}, len(jobTypes))}
-	for _, jobType := range jobTypes {
-		jobType = strings.TrimSpace(jobType)
-		if jobType != "" {
-			r.allowed[jobType] = struct{}{}
-		}
+// New creates an empty registry.
+func New() *Registry {
+	return &Registry{handlers: make(map[string]Handler)}
+}
+
+// Register binds a job type to its handler.
+func (r *Registry) Register(jobType string, handler Handler) error {
+	if r == nil {
+		return errors.New("handler registry is nil")
 	}
-	return r
+	jobType = strings.TrimSpace(jobType)
+	if jobType == "" {
+		return errors.New("job type is required")
+	}
+	if len(jobType) > domain.MaxJobTypeLength {
+		return fmt.Errorf("job type exceeds %d characters", domain.MaxJobTypeLength)
+	}
+	if handler == nil {
+		return fmt.Errorf("handler for %q is nil", jobType)
+	}
+	if _, exists := r.handlers[jobType]; exists {
+		return fmt.Errorf("%w: %s", ErrHandlerRegistered, jobType)
+	}
+	r.handlers[jobType] = handler
+	return nil
 }
 
-// DefaultRegistry returns the job types supported by this implementation.
-func DefaultRegistry() *Registry {
-	return NewRegistry(
-		"report.generate",
-		"email.send",
-		"webhook.deliver",
-		"data.import",
-	)
-}
-
-// Allows reports whether jobType is on the allow-list.
+// Allows reports whether jobType has a registered handler.
 func (r *Registry) Allows(jobType string) bool {
 	if r == nil {
 		return false
 	}
-	_, ok := r.allowed[jobType]
+	_, ok := r.handlers[jobType]
 	return ok
 }
 
-// Types returns the allowed job types in sorted order.
+// Handler returns the handler registered for jobType.
+func (r *Registry) Handler(jobType string) (Handler, bool) {
+	if r == nil {
+		return nil, false
+	}
+	handler, ok := r.handlers[jobType]
+	return handler, ok
+}
+
+// Types returns registered job types in sorted order.
 func (r *Registry) Types() []string {
 	if r == nil {
 		return nil
 	}
-	types := make([]string, 0, len(r.allowed))
-	for jobType := range r.allowed {
+	types := make([]string, 0, len(r.handlers))
+	for jobType := range r.handlers {
 		types = append(types, jobType)
 	}
 	sort.Strings(types)
