@@ -1,0 +1,57 @@
+package jobs
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
+	"github.com/google/uuid"
+)
+
+// Service owns submission and retrieval rules.
+type Service struct {
+	repo      Repository
+	validator *Validator
+	now       func() time.Time
+}
+
+// NewService wires a repository and validator together.
+func NewService(repo Repository, validator *Validator) *Service {
+	return &Service{
+		repo:      repo,
+		validator: validator,
+		now:       time.Now,
+	}
+}
+
+// Submit validates and persists a job. The boolean reports whether a new row
+// was created; false means an existing idempotent job was returned.
+func (s *Service) Submit(ctx context.Context, in SubmitInput) (*domain.Job, bool, error) {
+	if s.repo == nil {
+		return nil, false, fmt.Errorf("job repository is not configured")
+	}
+	if s.validator == nil {
+		return nil, false, fmt.Errorf("job validator is not configured")
+	}
+
+	job, err := s.validator.Build(in, s.now())
+	if err != nil {
+		return nil, false, err
+	}
+	return s.repo.CreateJob(ctx, job)
+}
+
+// Get returns a tenant-scoped job.
+func (s *Service) Get(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, error) {
+	if s.repo == nil {
+		return nil, fmt.Errorf("job repository is not configured")
+	}
+	if tenantID == uuid.Nil {
+		return nil, fmt.Errorf("%w: tenant_id is required", domain.ErrInvalidArgument)
+	}
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("%w: job id is required", domain.ErrInvalidArgument)
+	}
+	return s.repo.GetJobByID(ctx, tenantID, id)
+}
