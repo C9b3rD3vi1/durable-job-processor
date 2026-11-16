@@ -12,10 +12,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/auth"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/jobs"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/transport/http/dto"
 	"github.com/google/uuid"
+)
+
+const (
+	clientToken   = "djp_client-token"
+	operatorToken = "djp_operator-token"
 )
 
 type fakeService struct {
@@ -56,6 +62,39 @@ type fakePinger struct{ err error }
 
 func (p fakePinger) Ping(context.Context) error { return p.err }
 
+type fakeAuthenticator struct {
+	identities map[string]auth.Identity
+	err        error
+}
+
+func (f *fakeAuthenticator) Authenticate(_ context.Context, token string) (auth.Identity, error) {
+	if f.err != nil {
+		return auth.Identity{}, f.err
+	}
+	identity, ok := f.identities[token]
+	if !ok {
+		return auth.Identity{}, auth.ErrInvalidCredential
+	}
+	return identity, nil
+}
+
+func testAuthenticator(tenantID uuid.UUID) *fakeAuthenticator {
+	return &fakeAuthenticator{identities: map[string]auth.Identity{
+		clientToken: {
+			TenantID: tenantID,
+			KeyID:    uuid.New(),
+			KeyName:  "client-key",
+			Role:     auth.RoleClient,
+		},
+		operatorToken: {
+			TenantID: tenantID,
+			KeyID:    uuid.New(),
+			KeyName:  "operator-key",
+			Role:     auth.RoleOperator,
+		},
+	}}
+}
+
 func sampleJob(tenantID uuid.UUID) *domain.Job {
 	now := time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
 	return &domain.Job{
@@ -73,24 +112,29 @@ func sampleJob(tenantID uuid.UUID) *domain.Job {
 	}
 }
 
-func testRouter(service *fakeService, pinger Pinger, maxBody int64) http.Handler {
+func testRouter(service *fakeService, pinger Pinger, maxBody int64, authenticator auth.TokenAuthenticator) http.Handler {
 	return NewRouter(Options{
-		JobService:   service,
-		Pinger:       pinger,
-		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		MaxBodyBytes: maxBody,
+		JobService:    service,
+		Pinger:        pinger,
+		Authenticator: authenticator,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBodyBytes:  maxBody,
 	})
+}
+
+func authenticate(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
 }
 
 func TestCreateJob(t *testing.T) {
 	tenantID := uuid.New()
 	job := sampleJob(tenantID)
 	service := &fakeService{submitJob: job, submitCreated: true}
-	router := testRouter(service, fakePinger{}, 1<<20)
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 
 	body := `{"job_type":"report.generate","payload":{"report_id":"r-1"},"priority":2,"max_attempts":3}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(body))
-	req.Header.Set("X-Tenant-ID", tenantID.String())
+	authenticate(req, clientToken)
 	req.Header.Set("Idempotency-Key", "client-key")
 	rec := httptest.NewRecorder()
 
@@ -122,12 +166,12 @@ func TestCreateJobIdempotentReplay(t *testing.T) {
 	tenantID := uuid.New()
 	job := sampleJob(tenantID)
 	service := &fakeService{submitJob: job, submitCreated: false}
-	router := testRouter(service, fakePinger{}, 1<<20)
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(
 		`{"job_type":"report.generate","payload":{"report_id":"r-1"}}`,
 	))
-	req.Header.Set("X-Tenant-ID", tenantID.String())
+	authenticate(req, clientToken)
 	req.Header.Set("Idempotency-Key", "client-key")
 	rec := httptest.NewRecorder()
 
@@ -141,14 +185,36 @@ func TestCreateJobIdempotentReplay(t *testing.T) {
 	}
 }
 
+func TestTenantHeaderIsIgnored(t *testing.T) {
+	tenantID := uuid.New()
+	otherTenantID := uuid.New()
+	job := sampleJob(tenantID)
+	service := &fakeService{getJob: job}
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID.String(), nil)
+	authenticate(req, clientToken)
+	// A caller-supplied tenant header must never override verified identity.
+	req.Header.Set("X-Tenant-ID", otherTenantID.String())
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if service.gotTenant != tenantID {
+		t.Errorf("tenant = %v, want verified identity tenant %v", service.gotTenant, tenantID)
+	}
+}
+
 func TestGetJob(t *testing.T) {
 	tenantID := uuid.New()
 	job := sampleJob(tenantID)
 	service := &fakeService{getJob: job}
-	router := testRouter(service, fakePinger{}, 1<<20)
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job.ID.String(), nil)
-	req.Header.Set("X-Tenant-ID", tenantID.String())
+	authenticate(req, clientToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -163,10 +229,10 @@ func TestGetJob(t *testing.T) {
 func TestGetJobNotFound(t *testing.T) {
 	tenantID := uuid.New()
 	service := &fakeService{getErr: domain.ErrNotFound}
-	router := testRouter(service, fakePinger{}, 1<<20)
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+uuid.New().String(), nil)
-	req.Header.Set("X-Tenant-ID", tenantID.String())
+	authenticate(req, clientToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -182,10 +248,10 @@ func TestReplayJob(t *testing.T) {
 	job.Attempts = 0
 	job.ReplayCount = 1
 	service := &fakeService{replayJob: job}
-	router := testRouter(service, fakePinger{}, 1<<20)
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/replay", nil)
-	req.Header.Set("X-Tenant-ID", tenantID.String())
+	authenticate(req, operatorToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -195,8 +261,8 @@ func TestReplayJob(t *testing.T) {
 	if service.gotTenant != tenantID || service.gotID != job.ID {
 		t.Errorf("service got %v/%v, want %v/%v", service.gotTenant, service.gotID, tenantID, job.ID)
 	}
-	if service.gotReplayedBy != tenantID.String() {
-		t.Errorf("replayed_by = %q, want %q", service.gotReplayedBy, tenantID.String())
+	if service.gotReplayedBy != "operator-key" {
+		t.Errorf("replayed_by = %q, want the operator key name", service.gotReplayedBy)
 	}
 
 	var response dto.JobResponse
@@ -208,14 +274,41 @@ func TestReplayJob(t *testing.T) {
 	}
 }
 
+func TestReplayRequiresOperator(t *testing.T) {
+	tenantID := uuid.New()
+	job := sampleJob(tenantID)
+	service := &fakeService{replayJob: job}
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/replay", nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+	if service.gotID != uuid.Nil {
+		t.Errorf("service was called for a forbidden replay: job %v", service.gotID)
+	}
+
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "forbidden" {
+		t.Errorf("error code = %q, want forbidden", response.Error.Code)
+	}
+}
+
 func TestReplayJobRejectsNonDeadJob(t *testing.T) {
 	tenantID := uuid.New()
 	job := sampleJob(tenantID)
 	service := &fakeService{replayErr: domain.ErrInvalidTransition}
-	router := testRouter(service, fakePinger{}, 1<<20)
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/replay", nil)
-	req.Header.Set("X-Tenant-ID", tenantID.String())
+	authenticate(req, operatorToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -234,10 +327,10 @@ func TestReplayJobRejectsNonDeadJob(t *testing.T) {
 func TestReplayJobNotFound(t *testing.T) {
 	tenantID := uuid.New()
 	service := &fakeService{replayErr: domain.ErrNotFound}
-	router := testRouter(service, fakePinger{}, 1<<20)
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+uuid.New().String()+"/replay", nil)
-	req.Header.Set("X-Tenant-ID", tenantID.String())
+	authenticate(req, operatorToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -246,21 +339,11 @@ func TestReplayJobNotFound(t *testing.T) {
 	}
 }
 
-func TestReplayJobRequiresTenant(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
-	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+uuid.New().String()+"/replay", nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", rec.Code)
-	}
-}
-
 func TestReplayJobRejectsInvalidID(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/not-a-uuid/replay", nil)
-	req.Header.Set("X-Tenant-ID", uuid.New().String())
+	authenticate(req, operatorToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -269,8 +352,9 @@ func TestReplayJobRejectsInvalidID(t *testing.T) {
 	}
 }
 
-func TestRequiresTenant(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+func TestRequiresAuthentication(t *testing.T) {
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+uuid.New().String(), nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -278,24 +362,89 @@ func TestRequiresTenant(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "authentication_required" {
+		t.Errorf("error code = %q, want authentication_required", response.Error.Code)
+	}
 }
 
-func TestRejectsInvalidTenant(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+func TestRejectsMalformedAuthorization(t *testing.T) {
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	for _, header := range []string{
+		"Basic dXNlcjpwYXNz",
+		"Bearer",
+		"Bearer   ",
+		"Token " + clientToken,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+uuid.New().String(), nil)
+		req.Header.Set("Authorization", header)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("Authorization %q status = %d, want 401", header, rec.Code)
+		}
+	}
+}
+
+func TestRejectsInvalidAPIKey(t *testing.T) {
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
 	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+uuid.New().String(), nil)
-	req.Header.Set("X-Tenant-ID", "not-a-uuid")
+	authenticate(req, "djp_not-a-real-key")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "invalid_api_key" {
+		t.Errorf("error code = %q, want invalid_api_key", response.Error.Code)
+	}
+}
+
+func TestAuthenticationFailureReturnsInternalError(t *testing.T) {
+	tenantID := uuid.New()
+	authenticator := testAuthenticator(tenantID)
+	authenticator.err = errors.New("database unavailable")
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, authenticator)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+uuid.New().String(), nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+}
+
+func TestAuthenticationUnavailableFailsClosed(t *testing.T) {
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+uuid.New().String(), nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
 
 func TestRejectsInvalidJobID(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/not-a-uuid", nil)
-	req.Header.Set("X-Tenant-ID", uuid.New().String())
+	authenticate(req, clientToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -305,9 +454,10 @@ func TestRejectsInvalidJobID(t *testing.T) {
 }
 
 func TestRejectsInvalidJSON(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(`{`))
-	req.Header.Set("X-Tenant-ID", uuid.New().String())
+	authenticate(req, clientToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -317,11 +467,12 @@ func TestRejectsInvalidJSON(t *testing.T) {
 }
 
 func TestRejectsUnknownJSONField(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(
 		`{"job_type":"report.generate","payload":{},"tenant_id":"attacker"}`,
 	))
-	req.Header.Set("X-Tenant-ID", uuid.New().String())
+	authenticate(req, clientToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -331,11 +482,12 @@ func TestRejectsUnknownJSONField(t *testing.T) {
 }
 
 func TestRejectsOversizedBody(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 16)
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 16, testAuthenticator(tenantID))
 	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(
 		`{"job_type":"report.generate","payload":{"report_id":"r-1"}}`,
 	))
-	req.Header.Set("X-Tenant-ID", uuid.New().String())
+	authenticate(req, clientToken)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -344,8 +496,8 @@ func TestRejectsOversizedBody(t *testing.T) {
 	}
 }
 
-func TestHealthEndpoints(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+func TestHealthEndpointsArePublic(t *testing.T) {
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(uuid.New()))
 
 	live := httptest.NewRecorder()
 	router.ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/health/live", nil))
@@ -361,7 +513,7 @@ func TestHealthEndpoints(t *testing.T) {
 }
 
 func TestReadinessFailure(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{err: errors.New("db down")}, 1<<20)
+	router := testRouter(&fakeService{}, fakePinger{err: errors.New("db down")}, 1<<20, testAuthenticator(uuid.New()))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -370,7 +522,7 @@ func TestReadinessFailure(t *testing.T) {
 }
 
 func TestNotFound(t *testing.T) {
-	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(uuid.New()))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rec.Code != http.StatusNotFound {

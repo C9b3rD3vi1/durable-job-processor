@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/auth"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/jobs"
@@ -74,20 +75,36 @@ func newAPI(t *testing.T, pool *pgxpool.Pool) *httptest.Server {
 	repository := postgres.NewJobRepository(pool)
 	validator := jobs.NewValidator(handlers.DefaultRegistry(), 256*1024, 5)
 	service := jobs.NewService(repository, validator)
+	authenticator := auth.NewAuthenticator(postgres.NewAPIKeyRepository(pool))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	router := httpapi.NewRouter(httpapi.Options{
-		JobService:   service,
-		Pinger:       pool,
-		Logger:       logger,
-		MaxBodyBytes: 1 << 20,
+		JobService:    service,
+		Pinger:        pool,
+		Authenticator: authenticator,
+		Logger:        logger,
+		MaxBodyBytes:  1 << 20,
 	})
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
 	return server
 }
 
-func doRequest(t *testing.T, method, url string, tenantID *uuid.UUID, idempotencyKey string, body string) (*http.Response, []byte) {
+// createAPIKey provisions a key directly through the repository and returns its
+// one-time plaintext token. Tests never store plaintext anywhere else.
+func createAPIKey(t *testing.T, ctx context.Context, pool *pgxpool.Pool, tenantID uuid.UUID, name string, role auth.Role) string {
+	t.Helper()
+	token, hash, err := auth.GenerateToken()
+	if err != nil {
+		t.Fatalf("generate API key: %v", err)
+	}
+	if _, err := postgres.NewAPIKeyRepository(pool).CreateAPIKey(ctx, tenantID, name, role, hash); err != nil {
+		t.Fatalf("create API key: %v", err)
+	}
+	return token
+}
+
+func doRequest(t *testing.T, method, url, token, idempotencyKey string, body string) (*http.Response, []byte) {
 	t.Helper()
 	var reader io.Reader
 	if body != "" {
@@ -100,8 +117,8 @@ func doRequest(t *testing.T, method, url string, tenantID *uuid.UUID, idempotenc
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if tenantID != nil {
-		req.Header.Set("X-Tenant-ID", tenantID.String())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	if idempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", idempotencyKey)
@@ -133,8 +150,11 @@ func TestJobSubmissionPersistsAcrossRestart(t *testing.T) {
 
 	server1 := newAPI(t, pool1)
 
+	tenantToken := createAPIKey(t, ctx, pool1, tenantID, "client", auth.RoleClient)
+	otherTenantToken := createAPIKey(t, ctx, pool1, otherTenantID, "other-client", auth.RoleClient)
+
 	requestBody := `{"job_type":"report.generate","payload":{"report_id":"r-1","format":"pdf"},"priority":3,"max_attempts":4}`
-	resp, body := doRequest(t, http.MethodPost, server1.URL+"/v1/jobs", &tenantID, "submit-once", requestBody)
+	resp, body := doRequest(t, http.MethodPost, server1.URL+"/v1/jobs", tenantToken, "submit-once", requestBody)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("POST status = %d, want 202; body=%s", resp.StatusCode, body)
 	}
@@ -163,9 +183,10 @@ func TestJobSubmissionPersistsAcrossRestart(t *testing.T) {
 	server2 := newAPI(t, pool2)
 	defer func() {
 		_, _ = pool2.Exec(context.Background(), `DELETE FROM jobs WHERE tenant_id = $1`, tenantID.String())
+		_, _ = pool2.Exec(context.Background(), `DELETE FROM api_keys WHERE tenant_id IN ($1, $2)`, tenantID.String(), otherTenantID.String())
 	}()
 
-	resp, body = doRequest(t, http.MethodGet, server2.URL+"/v1/jobs/"+created.ID.String(), &tenantID, "", "")
+	resp, body = doRequest(t, http.MethodGet, server2.URL+"/v1/jobs/"+created.ID.String(), tenantToken, "", "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET after restart status = %d, want 200; body=%s", resp.StatusCode, body)
 	}
@@ -173,12 +194,17 @@ func TestJobSubmissionPersistsAcrossRestart(t *testing.T) {
 	if err := json.Unmarshal(body, &fetched); err != nil {
 		t.Fatalf("decode fetched job: %v", err)
 	}
-	if fetched.ID != created.ID || fetched.Status != "queued" || fetched.JobType != "report.generate" {
-		t.Fatalf("fetched job = %+v, want original queued job", fetched)
+	// A worker may claim the job between submission and this read, so the test
+	// asserts durable identity rather than freezing the lifecycle status.
+	if fetched.ID != created.ID || fetched.JobType != created.JobType || fetched.TenantID != created.TenantID {
+		t.Fatalf("fetched job = %+v, want the original job %v", fetched, created.ID)
+	}
+	if fetched.CreatedAt.IsZero() {
+		t.Fatal("fetched job has no created_at timestamp")
 	}
 
 	// The same idempotency key must return the existing durable job.
-	resp, body = doRequest(t, http.MethodPost, server2.URL+"/v1/jobs", &tenantID, "submit-once", requestBody)
+	resp, body = doRequest(t, http.MethodPost, server2.URL+"/v1/jobs", tenantToken, "submit-once", requestBody)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("duplicate POST status = %d, want 200; body=%s", resp.StatusCode, body)
 	}
@@ -205,20 +231,20 @@ func TestJobSubmissionPersistsAcrossRestart(t *testing.T) {
 	}
 
 	// Tenant scoping must hide the job from another tenant.
-	resp, body = doRequest(t, http.MethodGet, server2.URL+"/v1/jobs/"+created.ID.String(), &otherTenantID, "", "")
+	resp, body = doRequest(t, http.MethodGet, server2.URL+"/v1/jobs/"+created.ID.String(), otherTenantToken, "", "")
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-tenant GET status = %d, want 404; body=%s", resp.StatusCode, body)
 	}
 
 	// Identity is required at the edge.
-	resp, body = doRequest(t, http.MethodGet, server2.URL+"/v1/jobs/"+created.ID.String(), nil, "", "")
+	resp, body = doRequest(t, http.MethodGet, server2.URL+"/v1/jobs/"+created.ID.String(), "", "", "")
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("missing-tenant GET status = %d, want 401; body=%s", resp.StatusCode, body)
 	}
 
 	// Invalid payloads must be rejected before persistence.
 	invalidBody := `{"job_type":"report.generate","payload":[]}`
-	resp, body = doRequest(t, http.MethodPost, server2.URL+"/v1/jobs", &tenantID, "invalid", invalidBody)
+	resp, body = doRequest(t, http.MethodPost, server2.URL+"/v1/jobs", tenantToken, "invalid", invalidBody)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid payload status = %d, want 400; body=%s", resp.StatusCode, body)
 	}
@@ -309,6 +335,7 @@ func TestConcurrentIdempotentSubmissions(t *testing.T) {
 	}()
 
 	server := newAPI(t, pool)
+	token := createAPIKey(t, ctx, pool, tenantID, "concurrent-client", auth.RoleClient)
 	const requestCount = 8
 	requestBody := `{"job_type":"webhook.deliver","payload":{"url":"https://example.com/hook"}}`
 
@@ -332,7 +359,7 @@ func TestConcurrentIdempotentSubmissions(t *testing.T) {
 				return
 			}
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Tenant-ID", tenantID.String())
+			req.Header.Set("Authorization", "Bearer "+token)
 			req.Header.Set("Idempotency-Key", "concurrent-key")
 
 			resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)

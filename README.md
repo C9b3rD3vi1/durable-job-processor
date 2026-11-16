@@ -2,11 +2,13 @@
 
 A fault-tolerant background job processing system built with Go and PostgreSQL.
 
-**Phases 1–3 are implemented:** durable submission and retrieval, a worker that
-executes typed handlers with bounded concurrency, and the reliability layer:
-expiring leases, heartbeats, lease-token fencing, expired-job recovery, jittered
-retries, dead-lettering and audited manual replay. Observability, authentication
-and the delivery pipeline remain for later phases.
+**Phases 1–3 and API-key authentication are implemented:** durable submission and
+retrieval, a worker that executes typed handlers with bounded concurrency, the
+reliability layer (expiring leases, heartbeats, lease-token fencing, expired-job
+recovery, jittered retries, dead-lettering and audited manual replay), and
+hashed API keys that derive tenant and role from verified identity. Quotas,
+cancellation, job listing, observability and the delivery pipeline remain for
+later phases.
 
 ## What works in Phases 2–3
 
@@ -51,6 +53,19 @@ and the delivery pipeline remain for later phases.
 - `GET /health/live` and `GET /health/ready`.
 - Structured request logging and panic recovery.
 
+## What works in Phase 6 (API authentication)
+
+- Bearer API keys stored only as SHA-256 digests in the `api_keys` table; the
+  plaintext key is printed once at creation.
+- The request tenant comes from the authenticated key, never from a header or
+  payload. `X-Tenant-ID` is no longer accepted.
+- Two roles: `client` can submit and read jobs; `operator` can additionally
+  replay dead-letter jobs.
+- Immediate revocation: a revoked key stops authenticating on the next request.
+- `cmd/apikey` provisions, lists and revokes keys without exposing digests.
+- Missing, malformed, unknown and revoked keys return `401`; a valid key without
+  the operator role receives `403` on replay.
+
 Job payloads are deliberately omitted from API responses to avoid exposing
 sensitive data. Lease fields and idempotency keys are internal.
 
@@ -73,7 +88,12 @@ set -a; source .env; set +a
 # 3. Apply migrations
 go run ./cmd/migrate
 
-# 4. Run the API
+# 4. Provision an API key for a tenant (prints the key once)
+TENANT_ID="$(uuidgen)"
+go run ./cmd/apikey create -tenant "$TENANT_ID" -name local-dev -role operator
+export API_KEY="djp_..."   # copy the key printed above
+
+# 5. Run the API
 go run ./cmd/api
 ```
 
@@ -88,16 +108,55 @@ Alternatively, set `AUTO_MIGRATE=true` to apply migrations when the API or
 worker starts. A separate migrate command is recommended for controlled
 deployments.
 
+## API authentication
+
+Every `/v1` request must send the key as a bearer token:
+
+```http
+Authorization: Bearer djp_...
+```
+
+Keys are generated with 256 bits of entropy and stored as SHA-256 digests, so the
+database cannot be used to recover a usable credential. Each key belongs to one
+tenant and one role:
+
+| Role | Permissions |
+|---|---|
+| `client` | Submit jobs, read jobs in its tenant |
+| `operator` | Everything a client can do, plus replay dead jobs |
+
+The tenant is derived from the authenticated key. A caller cannot select a
+different tenant with a header or request field; cross-tenant reads and replays
+return `404`.
+
+Provision and manage keys with `DATABASE_URL` set:
+
+```bash
+# Create a client key. The plaintext key is shown once and cannot be retrieved.
+go run ./cmd/apikey create -tenant "$TENANT_ID" -name reporting-client -role client
+
+# Create an operator key for dead-letter replay.
+go run ./cmd/apikey create -tenant "$TENANT_ID" -name on-call-operator -role operator
+
+# List keys for a tenant. Digests are never printed.
+go run ./cmd/apikey list -tenant "$TENANT_ID"
+
+# Revoke a key immediately. Revoking an already revoked key is a no-op.
+go run ./cmd/apikey revoke -tenant "$TENANT_ID" -name reporting-client
+```
+
+Key names are unique within a tenant. If a key is lost, revoke it and create a
+replacement; there is no recovery path by design. Rate limits and per-tenant
+quotas are tracked as remaining Phase 6 work.
+
 ## API examples
 
 Submit a job:
 
 ```bash
-TENANT_ID="$(uuidgen)"
-
 curl -i -X POST http://localhost:8080/v1/jobs \
   -H "Content-Type: application/json" \
-  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Idempotency-Key: report-2026-11-15-001" \
   -d '{
     "job_type": "report.generate",
@@ -129,7 +188,7 @@ Retrieve it:
 
 ```bash
 curl http://localhost:8080/v1/jobs/<job-id> \
-  -H "X-Tenant-ID: $TENANT_ID"
+  -H "Authorization: Bearer $API_KEY"
 ```
 
 Supported job types and their built-in handlers:
@@ -144,10 +203,10 @@ Supported job types and their built-in handlers:
 The API rejects a job type that has no registered handler, so the allow-list and
 the worker dispatch table cannot drift.
 
-> **Identity note:** `X-Tenant-ID` is a development boundary. The
-> architecture requires deriving tenancy from verified authentication claims.
-> Replace this header with authentication in Phase 6; never trust tenant IDs from
-> request payloads.
+> **Identity note:** tenancy and authorization come from the verified API key.
+> `X-Tenant-ID` is not accepted, and payload fields cannot select a tenant. Use
+> the `client` role for submission/read clients and the `operator` role only for
+> controlled dead-letter replay.
 
 ## Worker execution
 
@@ -191,7 +250,7 @@ Observe a job after submitting it:
 
 ```bash
 curl http://localhost:8080/v1/jobs/<job-id> \
-  -H "X-Tenant-ID: $TENANT_ID"
+  -H "Authorization: Bearer $API_KEY"
 ```
 
 The response moves from `queued` to `running` and then to `succeeded` or
@@ -199,12 +258,14 @@ The response moves from `queued` to `running` and then to `succeeded` or
 
 ```bash
 curl -X POST http://localhost:8080/v1/jobs/<job-id>/replay \
-  -H "X-Tenant-ID: $TENANT_ID"
+  -H "Authorization: Bearer $OPERATOR_API_KEY"
 ```
 
-Only `dead` jobs are eligible. A replay returns the job with `status=retry_wait`,
-`attempts=0` and an incremented `replay_count`; replaying any other status
-returns `409`, and another tenant's job returns `404`.
+Only `dead` jobs are eligible, and the key must have the `operator` role; a
+`client` key receives `403`. A replay returns the job with `status=retry_wait`,
+`attempts=0` and an incremented `replay_count`; the operator key name is stored
+in `replayed_by`. Replaying any other status returns `409`, and another tenant's
+job returns `404`.
 
 Inspect the durable row directly for internal fields:
 
@@ -260,6 +321,9 @@ go run ./cmd/migrate
 `jobs` table, validation constraints and the ready/lease/tenant/idempotency
 indexes. `migrations/0002_add_replay_audit.sql` adds the durable
 `replay_count`, `replayed_by` and `replayed_at` audit columns.
+`migrations/0003_add_api_keys.sql` adds the `api_keys` table with role checks,
+per-tenant unique names, unique 32-byte SHA-256 digests and revocation
+timestamps.
 
 ## Tests
 
@@ -280,7 +344,9 @@ The integration suite verifies:
 - jobs persist across a full API and connection-pool restart;
 - concurrent-safe idempotency returns one durable row;
 - tenant isolation returns `404` for another tenant;
-- missing identity returns `401`;
+- missing, malformed, unknown and revoked API keys return `401`;
+- client keys cannot replay dead jobs while operator keys can;
+- `api_keys` stores only a 32-byte SHA-256 digest;
 - invalid payloads are rejected before persistence;
 - migrations are idempotent;
 - workers claim jobs atomically across concurrent claimers;
@@ -294,7 +360,8 @@ The integration suite verifies:
 - permanent failures dead-letter immediately and transient failures schedule a
   jittered retry;
 - replay moves a dead job back to `retry_wait`, resets attempts, records the
-  audit columns and rejects non-dead or cross-tenant jobs.
+  audit columns and rejects non-dead or cross-tenant jobs;
+- only operator keys can replay, and `replayed_by` records the operator key name.
 
 Phase 2–3 claim and concurrency tests run in throwaway PostgreSQL schemas, so
 they do not depend on or disturb development data. Integration tests are skipped
@@ -304,8 +371,10 @@ when no `TEST_DATABASE_URL` or `DATABASE_URL` is set.
 
 ```
 cmd/api/                 API entrypoint and graceful shutdown
+cmd/apikey/              API-key provisioning, listing and revocation CLI
 cmd/migrate/             Migration entrypoint
 cmd/worker/              Worker entrypoint and graceful shutdown
+internal/auth/           API-key generation, hashing, roles and authentication
 internal/config/         Environment configuration and validation
 internal/domain/         Job model, statuses, transitions, errors
 internal/jobs/           Repository interface, validator and service
@@ -329,7 +398,7 @@ docs/architecture/       Architecture blueprint and diagrams
 | 3 — Concurrency and bounded pool | Implemented with Phase 2 |
 | 4 — Leases, heartbeat and recovery | Implemented with Phase 3 |
 | 5 — Retry, dead-letter and replay | Implemented with Phase 3 |
-| 6 — Authentication and tenant hardening | Planned |
+| 6 — Authentication and tenant hardening | API-key authentication implemented; quotas, cancellation and listing pending |
 | 7 — Observability | Planned |
 | 8 — Containers and CI | Planned |
 | 9 — AWS and Terraform | Planned |

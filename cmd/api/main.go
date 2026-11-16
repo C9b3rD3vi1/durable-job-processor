@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/auth"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/config"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/jobs"
@@ -64,12 +65,14 @@ func run() error {
 	repository := postgres.NewJobRepository(pool)
 	validator := jobs.NewValidator(handlers.DefaultRegistry(), cfg.MaxPayloadBytes, cfg.MaxAttempts)
 	service := jobs.NewService(repository, validator)
+	authenticator := auth.NewAuthenticator(postgres.NewAPIKeyRepository(pool))
 
 	router := httpapi.NewRouter(httpapi.Options{
-		JobService:   service,
-		Pinger:       pool,
-		Logger:       logger,
-		MaxBodyBytes: cfg.RequestBodyLimit(),
+		JobService:    service,
+		Pinger:        pool,
+		Authenticator: authenticator,
+		Logger:        logger,
+		MaxBodyBytes:  cfg.RequestBodyLimit(),
 	})
 
 	server := &http.Server{

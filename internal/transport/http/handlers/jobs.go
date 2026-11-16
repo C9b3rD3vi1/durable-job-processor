@@ -43,11 +43,12 @@ func NewJobsHandler(service JobService, logger *slog.Logger, maxBodyBytes int64)
 
 // CreateJob handles POST /v1/jobs.
 func (h *JobsHandler) CreateJob(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := middleware.TenantID(r.Context())
+	identity, ok := middleware.IdentityFrom(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "tenant_required", "tenant context is missing")
+		writeError(w, http.StatusUnauthorized, "authentication_required", "authentication is required")
 		return
 	}
+	tenantID := identity.TenantID
 
 	var req dto.CreateJobRequest
 	if err := h.decodeJSON(w, r, &req); err != nil {
@@ -93,11 +94,12 @@ func (h *JobsHandler) CreateJob(w http.ResponseWriter, r *http.Request) {
 
 // GetJob handles GET /v1/jobs/{id}.
 func (h *JobsHandler) GetJob(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := middleware.TenantID(r.Context())
+	identity, ok := middleware.IdentityFrom(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "tenant_required", "tenant context is missing")
+		writeError(w, http.StatusUnauthorized, "authentication_required", "authentication is required")
 		return
 	}
+	tenantID := identity.TenantID
 
 	id, err := uuid.Parse(strings.TrimSpace(r.PathValue("id")))
 	if err != nil || id == uuid.Nil {
@@ -113,14 +115,19 @@ func (h *JobsHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto.NewJobResponse(job))
 }
 
-// ReplayJob handles POST /v1/jobs/{id}/replay. Only dead jobs owned by the
-// caller's tenant are eligible.
+// ReplayJob handles POST /v1/jobs/{id}/replay. Only operators may replay, and
+// only dead jobs owned by the operator's tenant are eligible.
 func (h *JobsHandler) ReplayJob(w http.ResponseWriter, r *http.Request) {
-	tenantID, ok := middleware.TenantID(r.Context())
+	identity, ok := middleware.IdentityFrom(r.Context())
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "tenant_required", "tenant context is missing")
+		writeError(w, http.StatusUnauthorized, "authentication_required", "authentication is required")
 		return
 	}
+	if !identity.IsOperator() {
+		writeError(w, http.StatusForbidden, "forbidden", "operator role is required to replay dead jobs")
+		return
+	}
+	tenantID := identity.TenantID
 
 	id, err := uuid.Parse(strings.TrimSpace(r.PathValue("id")))
 	if err != nil || id == uuid.Nil {
@@ -128,9 +135,8 @@ func (h *JobsHandler) ReplayJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Until Phase 6 supplies an authenticated operator identity, the tenant is
-	// the auditable replay actor.
-	replayedBy := tenantID.String()
+	// The authenticated operator key is the auditable replay actor.
+	replayedBy := identity.KeyName
 	job, err := h.service.Replay(r.Context(), tenantID, id, replayedBy)
 	if err != nil {
 		h.handleServiceError(w, r, tenantID, id, err)
@@ -142,6 +148,7 @@ func (h *JobsHandler) ReplayJob(w http.ResponseWriter, r *http.Request) {
 		"tenant_id", tenantID,
 		"job_id", job.ID,
 		"replayed_by", replayedBy,
+		"api_key_id", identity.KeyID,
 		"replay_count", job.ReplayCount,
 	)
 	writeJSON(w, http.StatusOK, dto.NewJobResponse(job))
