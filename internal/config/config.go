@@ -21,12 +21,14 @@ const (
 	defaultHeartbeatInterval = 15 * time.Second
 	defaultHandlerTimeout    = 30 * time.Second
 	defaultRetryBaseDelay    = 5 * time.Second
+	defaultRetryMaxDelay     = 15 * time.Minute
+	defaultRecoveryInterval  = 30 * time.Second
 	defaultMaxPayloadBytes   = 256 * 1024
 )
 
 // Config is the complete runtime configuration for the API and worker binaries.
-// Phase 1 consumes the database, HTTP and logging settings; worker settings are
-// loaded now so the same configuration contract is ready for Phase 2.
+// The API consumes the database, HTTP and logging settings; the worker also
+// consumes the lease, heartbeat, retry and recovery settings.
 type Config struct {
 	Environment string
 	LogLevel    string
@@ -45,6 +47,8 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	HandlerTimeout    time.Duration
 	RetryBaseDelay    time.Duration
+	RetryMaxDelay     time.Duration
+	RecoveryInterval  time.Duration
 	MaxAttempts       int
 	MaxPayloadBytes   int64
 }
@@ -100,6 +104,12 @@ func Load() (Config, error) {
 	if cfg.RetryBaseDelay, err = envDuration("RETRY_BASE_DELAY", defaultRetryBaseDelay); err != nil {
 		return Config{}, err
 	}
+	if cfg.RetryMaxDelay, err = envDuration("RETRY_MAX_DELAY", defaultRetryMaxDelay); err != nil {
+		return Config{}, err
+	}
+	if cfg.RecoveryInterval, err = envDuration("RECOVERY_INTERVAL", defaultRecoveryInterval); err != nil {
+		return Config{}, err
+	}
 	if cfg.WorkerConcurrency, err = envInt("WORKER_CONCURRENCY", defaultWorkerConcurrency); err != nil {
 		return Config{}, err
 	}
@@ -135,11 +145,14 @@ func Load() (Config, error) {
 	if cfg.HandlerTimeout <= 0 {
 		return Config{}, fmt.Errorf("HANDLER_TIMEOUT must be positive")
 	}
-	if cfg.HandlerTimeout > cfg.LeaseDuration {
-		return Config{}, fmt.Errorf("HANDLER_TIMEOUT must not exceed LEASE_DURATION")
-	}
 	if cfg.RetryBaseDelay <= 0 {
 		return Config{}, fmt.Errorf("RETRY_BASE_DELAY must be positive")
+	}
+	if cfg.RetryMaxDelay <= 0 {
+		return Config{}, fmt.Errorf("RETRY_MAX_DELAY must be positive")
+	}
+	if cfg.RecoveryInterval <= 0 {
+		return Config{}, fmt.Errorf("RECOVERY_INTERVAL must be positive")
 	}
 	if cfg.MaxAttempts < 1 || cfg.MaxAttempts > domain.MaxAttemptsLimit {
 		return Config{}, fmt.Errorf("MAX_ATTEMPTS must be between 1 and %d", domain.MaxAttemptsLimit)

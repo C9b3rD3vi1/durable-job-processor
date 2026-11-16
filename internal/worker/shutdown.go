@@ -24,14 +24,22 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.loop(ctx, handlerCtx)
 		}()
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.recoveryLoop(ctx)
+	}()
 
 	r.logger.Info("worker started",
 		"worker_id", r.workerID,
 		"concurrency", r.concurrency,
 		"poll_interval", r.pollInterval.String(),
 		"lease_duration", r.leaseDuration.String(),
+		"heartbeat_interval", r.heartbeatInterval.String(),
 		"handler_timeout", r.handlerTimeout.String(),
 		"retry_base_delay", r.retryBaseDelay.String(),
+		"retry_max_delay", r.retryPolicy.MaxDelay.String(),
+		"recovery_interval", r.recoveryInterval.String(),
 	)
 
 	<-ctx.Done()

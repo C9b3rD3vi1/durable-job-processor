@@ -59,16 +59,19 @@ func run() error {
 	}
 
 	runner, err := worker.New(worker.Config{
-		Store:           postgres.NewJobRepository(pool),
-		Registry:        handlers.DefaultRegistry(),
-		Logger:          logger,
-		WorkerID:        workerID(),
-		Concurrency:     cfg.WorkerConcurrency,
-		PollInterval:    cfg.PollInterval,
-		LeaseDuration:   cfg.LeaseDuration,
-		HandlerTimeout:  cfg.HandlerTimeout,
-		RetryBaseDelay:  cfg.RetryBaseDelay,
-		ShutdownTimeout: cfg.ShutdownTimeout,
+		Store:             postgres.NewJobRepository(pool),
+		Registry:          handlers.DefaultRegistry(),
+		Logger:            logger,
+		WorkerID:          workerID(),
+		Concurrency:       cfg.WorkerConcurrency,
+		PollInterval:      cfg.PollInterval,
+		LeaseDuration:     cfg.LeaseDuration,
+		HeartbeatInterval: cfg.HeartbeatInterval,
+		HandlerTimeout:    cfg.HandlerTimeout,
+		RetryBaseDelay:    cfg.RetryBaseDelay,
+		RetryMaxDelay:     cfg.RetryMaxDelay,
+		RecoveryInterval:  cfg.RecoveryInterval,
+		ShutdownTimeout:   cfg.ShutdownTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("create worker: %w", err)

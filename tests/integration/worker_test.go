@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/postgres"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/retry"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/worker"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -665,5 +667,289 @@ func TestWorkerHonorsConcurrency(t *testing.T) {
 	}
 	if peak < 2 {
 		t.Errorf("peak concurrency = %d, want at least 2", peak)
+	}
+}
+
+func TestHeartbeatKeepsLeaseAliveBeyondLeaseDuration(t *testing.T) {
+	databaseURL := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := mustIsolatedPool(t, databaseURL)
+
+	tenantID := uuid.New()
+
+	repository := postgres.NewJobRepository(pool)
+	job := createWorkerJob(t, ctx, repository, tenantID, "integration.heartbeat", `{}`, 0, time.Now().Add(-time.Second), 0, 1)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	registry := handlers.New()
+	if err := registry.Register("integration.heartbeat", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		close(started)
+		<-release
+		return json.RawMessage(`{"ok":true}`), nil
+	})); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	runner := newWorkerRunner(t, repository, registry, func(cfg *worker.Config) {
+		// The handler deliberately outlives the original lease. Heartbeats must
+		// renew it, and the handler timeout is allowed to exceed the lease.
+		cfg.LeaseDuration = 200 * time.Millisecond
+		cfg.HeartbeatInterval = 20 * time.Millisecond
+		cfg.HandlerTimeout = 2 * time.Second
+		cfg.RecoveryInterval = time.Hour
+	})
+	startWorker(t, runner)
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+
+	// Wait beyond the original lease, then ask recovery to scan. A live
+	// heartbeat must prevent the row from being treated as abandoned.
+	time.Sleep(400 * time.Millisecond)
+	result, err := repository.RecoverExpiredJobs(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecoverExpiredJobs() error = %v", err)
+	}
+	if result.Requeued != 0 || result.Dead != 0 {
+		t.Fatalf("recovery touched a live lease: %+v", result)
+	}
+
+	close(release)
+	waitForJobStatus(t, pool, job.ID, domain.StatusSucceeded, 5*time.Second)
+
+	got, err := repository.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("get completed job: %v", err)
+	}
+	if got.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", got.Attempts)
+	}
+}
+
+func TestRecoveryRequeuesExpiredLease(t *testing.T) {
+	databaseURL := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := mustIsolatedPool(t, databaseURL)
+
+	tenantID := uuid.New()
+
+	repository := postgres.NewJobRepository(pool)
+	job := createWorkerJob(t, ctx, repository, tenantID, "integration.recover", `{}`, 0, time.Now().Add(-time.Second), 0, 3)
+
+	claimed, err := repository.ClaimJob(ctx, "crashed-worker", 50*time.Millisecond)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim job = %v, %v", claimed, err)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	result, err := repository.RecoverExpiredJobs(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecoverExpiredJobs() error = %v", err)
+	}
+	if result.Requeued != 1 || result.Dead != 0 {
+		t.Fatalf("recovery result = %+v, want 1 requeued and 0 dead", result)
+	}
+
+	got, err := repository.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("get recovered job: %v", err)
+	}
+	if got.Status != domain.StatusRetryWait {
+		t.Errorf("status = %q, want retry_wait", got.Status)
+	}
+	if got.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (recovery must not increment)", got.Attempts)
+	}
+	if got.LockedBy != nil || got.LeaseToken != nil || got.LockedUntil != nil || got.HeartbeatAt != nil {
+		t.Errorf("lease fields not cleared: %+v", got)
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "lease expired") {
+		t.Errorf("last_error = %v, want lease expiry context", got.LastError)
+	}
+	if got.FinishedAt != nil {
+		t.Error("finished_at must be nil for a requeued job")
+	}
+
+	claimedAgain, err := repository.ClaimJob(ctx, "healthy-worker", time.Minute)
+	if err != nil || claimedAgain == nil {
+		t.Fatalf("reclaim job = %v, %v", claimedAgain, err)
+	}
+	if claimedAgain.ID != job.ID {
+		t.Errorf("reclaimed job = %s, want %s", claimedAgain.ID, job.ID)
+	}
+	if claimedAgain.Attempts != 2 {
+		t.Errorf("attempts after reclaim = %d, want 2", claimedAgain.Attempts)
+	}
+}
+
+func TestRecoveryDeadLettersExhaustedLease(t *testing.T) {
+	databaseURL := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := mustIsolatedPool(t, databaseURL)
+
+	tenantID := uuid.New()
+
+	repository := postgres.NewJobRepository(pool)
+	job := createWorkerJob(t, ctx, repository, tenantID, "integration.recover", `{}`, 0, time.Now().Add(-time.Second), 0, 1)
+
+	claimed, err := repository.ClaimJob(ctx, "crashed-worker", 50*time.Millisecond)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim job = %v, %v", claimed, err)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	result, err := repository.RecoverExpiredJobs(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecoverExpiredJobs() error = %v", err)
+	}
+	if result.Requeued != 0 || result.Dead != 1 {
+		t.Fatalf("recovery result = %+v, want 0 requeued and 1 dead", result)
+	}
+
+	got, err := repository.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("get dead job: %v", err)
+	}
+	if got.Status != domain.StatusDead {
+		t.Errorf("status = %q, want dead", got.Status)
+	}
+	if got.FinishedAt == nil {
+		t.Error("finished_at is nil for a job dead-lettered by recovery")
+	}
+	if got.LastError == nil || !strings.Contains(*got.LastError, "lease expired") {
+		t.Errorf("last_error = %v, want lease expiry context", got.LastError)
+	}
+	if got.LockedBy != nil || got.LeaseToken != nil || got.LockedUntil != nil {
+		t.Error("lease fields were not cleared")
+	}
+}
+
+func TestRecoveryLeavesLiveLeaseAlone(t *testing.T) {
+	databaseURL := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := mustIsolatedPool(t, databaseURL)
+
+	tenantID := uuid.New()
+
+	repository := postgres.NewJobRepository(pool)
+	job := createWorkerJob(t, ctx, repository, tenantID, "integration.live", `{}`, 0, time.Now().Add(-time.Second), 0, 3)
+
+	claimed, err := repository.ClaimJob(ctx, "live-worker", time.Minute)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim job = %v, %v", claimed, err)
+	}
+
+	result, err := repository.RecoverExpiredJobs(ctx, 10)
+	if err != nil {
+		t.Fatalf("RecoverExpiredJobs() error = %v", err)
+	}
+	if result.Requeued != 0 || result.Dead != 0 {
+		t.Fatalf("recovery touched a live lease: %+v", result)
+	}
+
+	if other, err := repository.ClaimJob(ctx, "other-worker", time.Minute); err != nil || other != nil {
+		t.Fatalf("second claim of a live lease = %v, %v; want nil, nil", other, err)
+	}
+
+	completed, err := repository.CompleteJob(ctx, job.ID, *claimed.LeaseToken, json.RawMessage(`{"ok":true}`))
+	if err != nil || !completed {
+		t.Fatalf("CompleteJob() after recovery scan = %v, %v; want true, nil", completed, err)
+	}
+}
+
+func TestWorkerPermanentFailureDeadLettersImmediately(t *testing.T) {
+	databaseURL := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := mustIsolatedPool(t, databaseURL)
+
+	tenantID := uuid.New()
+
+	repository := postgres.NewJobRepository(pool)
+	job := createWorkerJob(t, ctx, repository, tenantID, "integration.permanent", `{}`, 0, time.Now().Add(-time.Second), 0, 5)
+
+	registry := handlers.New()
+	if err := registry.Register("integration.permanent", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		return nil, retry.Permanent(errors.New("payload cannot be processed"))
+	})); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	startWorker(t, newWorkerRunner(t, repository, registry, nil))
+	waitForJobStatus(t, pool, job.ID, domain.StatusDead, 5*time.Second)
+
+	got, err := repository.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("get dead job: %v", err)
+	}
+	if got.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (permanent failures must not retry)", got.Attempts)
+	}
+	if got.LastError == nil || *got.LastError != "payload cannot be processed" {
+		t.Errorf("last_error = %v, want payload cannot be processed", got.LastError)
+	}
+}
+
+func TestWorkerTransientFailureRetriesThenSucceeds(t *testing.T) {
+	databaseURL := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := mustIsolatedPool(t, databaseURL)
+
+	tenantID := uuid.New()
+
+	repository := postgres.NewJobRepository(pool)
+	job := createWorkerJob(t, ctx, repository, tenantID, "integration.transient", `{}`, 0, time.Now().Add(-time.Second), 0, 3)
+
+	var calls atomic.Int32
+	registry := handlers.New()
+	if err := registry.Register("integration.transient", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		if calls.Add(1) == 1 {
+			return nil, retry.Transient(errors.New("upstream unavailable"))
+		}
+		return json.RawMessage(`{"ok":true}`), nil
+	})); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	// A short ceiling keeps the assertion focused on the retry outcome. The
+	// exact jittered schedule is covered deterministically at the repository
+	// and policy layers.
+	runner := newWorkerRunner(t, repository, registry, func(cfg *worker.Config) {
+		cfg.RetryBaseDelay = 10 * time.Millisecond
+		cfg.RetryMaxDelay = 10 * time.Millisecond
+	})
+	startWorker(t, runner)
+
+	waitForJobStatus(t, pool, job.ID, domain.StatusSucceeded, 10*time.Second)
+
+	got, err := repository.GetJobByID(ctx, tenantID, job.ID)
+	if err != nil {
+		t.Fatalf("get retried job: %v", err)
+	}
+	if got.Attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (one transient retry)", got.Attempts)
+	}
+	if calls.Load() != 2 {
+		t.Errorf("handler calls = %d, want 2", calls.Load())
+	}
+	if got.LastError != nil {
+		t.Errorf("last_error = %v, want cleared after success", got.LastError)
 	}
 }

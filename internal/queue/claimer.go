@@ -24,4 +24,14 @@ type Store interface {
 	// retry; otherwise, or once attempts are exhausted, the job is dead-lettered.
 	// It returns false when the lease token is no longer current.
 	FailJob(ctx context.Context, id, leaseToken uuid.UUID, cause string, retryDelay time.Duration) (bool, error)
+
+	// HeartbeatJob renews a running job's lease. It returns false when the
+	// lease token is no longer current, which means the worker has lost
+	// ownership and must stop attempting state changes.
+	HeartbeatJob(ctx context.Context, id, leaseToken uuid.UUID, leaseDuration time.Duration) (bool, error)
+
+	// RecoverExpiredJobs requeues or dead-letters running jobs whose lease has
+	// expired. The operation is fenced by the scan itself and is safe to run
+	// from several workers concurrently.
+	RecoverExpiredJobs(ctx context.Context, limit int) (RecoveryResult, error)
 }

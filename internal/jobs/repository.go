@@ -15,4 +15,9 @@ type Repository interface {
 
 	// GetJobByID returns a tenant-scoped job or domain.ErrNotFound.
 	GetJobByID(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, error)
+
+	// ReplayJob returns an eligible dead job to retry_wait and records the
+	// operator identity in the durable replay audit columns. It returns
+	// domain.ErrInvalidTransition when the job exists but is not dead.
+	ReplayJob(ctx context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error)
 }

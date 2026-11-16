@@ -20,6 +20,7 @@ import (
 type JobService interface {
 	Submit(ctx context.Context, in jobs.SubmitInput) (*domain.Job, bool, error)
 	Get(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, error)
+	Replay(ctx context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error)
 }
 
 // JobsHandler implements the job submission and lookup endpoints.
@@ -112,6 +113,40 @@ func (h *JobsHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto.NewJobResponse(job))
 }
 
+// ReplayJob handles POST /v1/jobs/{id}/replay. Only dead jobs owned by the
+// caller's tenant are eligible.
+func (h *JobsHandler) ReplayJob(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := middleware.TenantID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "tenant_required", "tenant context is missing")
+		return
+	}
+
+	id, err := uuid.Parse(strings.TrimSpace(r.PathValue("id")))
+	if err != nil || id == uuid.Nil {
+		writeError(w, http.StatusBadRequest, "invalid_job_id", "job id must be a valid UUID")
+		return
+	}
+
+	// Until Phase 6 supplies an authenticated operator identity, the tenant is
+	// the auditable replay actor.
+	replayedBy := tenantID.String()
+	job, err := h.service.Replay(r.Context(), tenantID, id, replayedBy)
+	if err != nil {
+		h.handleServiceError(w, r, tenantID, id, err)
+		return
+	}
+
+	h.logger.Info("job replayed",
+		"event", "job.replayed",
+		"tenant_id", tenantID,
+		"job_id", job.ID,
+		"replayed_by", replayedBy,
+		"replay_count", job.ReplayCount,
+	)
+	writeJSON(w, http.StatusOK, dto.NewJobResponse(job))
+}
+
 func (h *JobsHandler) decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
 	decoder := json.NewDecoder(r.Body)
@@ -131,6 +166,8 @@ func (h *JobsHandler) handleServiceError(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, "invalid_job", err.Error())
 	case errors.Is(err, domain.ErrNotFound):
 		writeError(w, http.StatusNotFound, "job_not_found", "job not found")
+	case errors.Is(err, domain.ErrInvalidTransition):
+		writeError(w, http.StatusConflict, "invalid_transition", "only dead jobs can be replayed")
 	case errors.Is(err, context.Canceled):
 		writeError(w, http.StatusRequestTimeout, "request_canceled", "request was canceled")
 	default:

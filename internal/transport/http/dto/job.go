@@ -30,6 +30,8 @@ type JobResponse struct {
 	MaxAttempts int              `json:"max_attempts"`
 	Result      json.RawMessage  `json:"result,omitempty"`
 	LastError   *string          `json:"last_error,omitempty"`
+	ReplayCount int              `json:"replay_count"`
+	ReplayedAt  *time.Time       `json:"replayed_at,omitempty"`
 	CreatedAt   time.Time        `json:"created_at"`
 	UpdatedAt   time.Time        `json:"updated_at"`
 	StartedAt   *time.Time       `json:"started_at,omitempty"`
@@ -49,6 +51,8 @@ func NewJobResponse(job *domain.Job) JobResponse {
 		MaxAttempts: job.MaxAttempts,
 		Result:      job.Result,
 		LastError:   job.LastError,
+		ReplayCount: job.ReplayCount,
+		ReplayedAt:  utcTime(job.ReplayedAt),
 		CreatedAt:   job.CreatedAt.UTC(),
 		UpdatedAt:   job.UpdatedAt.UTC(),
 		StartedAt:   utcTime(job.StartedAt),

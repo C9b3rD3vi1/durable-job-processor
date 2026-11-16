@@ -3,12 +3,12 @@
 A fault-tolerant background job processing system built with Go and PostgreSQL.
 
 **Phases 1–3 are implemented:** durable submission and retrieval, a worker that
-executes typed handlers, and bounded concurrent claiming across workers. Jobs
-move through fenced lifecycle transitions backed by PostgreSQL. Heartbeats,
-expired-lease recovery, richer retry classification and observability are planned
-for later phases.
+executes typed handlers with bounded concurrency, and the reliability layer:
+expiring leases, heartbeats, lease-token fencing, expired-job recovery, jittered
+retries, dead-lettering and audited manual replay. Observability, authentication
+and the delivery pipeline remain for later phases.
 
-## What works in Phase 2–3
+## What works in Phases 2–3
 
 - A separate `cmd/worker` binary shares the PostgreSQL store with the API.
 - A handler registry maps each allow-listed job type to an executable handler;
@@ -25,9 +25,18 @@ for later phases.
   `SHUTDOWN_TIMEOUT`, then cancels their contexts.
 - Built-in handlers for `report.generate`, `email.send`, `data.import` and a real
   HTTP `webhook.deliver`.
-- Handler failures retry with `RETRY_BASE_DELAY` until `max_attempts` is
-  exhausted, then dead-letter. Phase 5 will add failure classification and
-  jittered exponential backoff.
+- Expiring leases renewed by a per-job heartbeat. A worker that loses its lease
+  is cancelled and cannot write completion or failure state.
+- A background recovery loop requeues running jobs whose lease expired, or
+  dead-letters them once attempts are exhausted.
+- Failure classification through `retry.Transient`, `retry.Permanent` and
+  `retry.Cancelled`. Unknown failures retry conservatively; webhook 4xx
+  responses are permanent while 5xx, network and timeout failures are transient.
+- Full-jitter exponential backoff capped by `RETRY_MAX_DELAY`, with
+  `MAX_ATTEMPTS` as the hard retry limit.
+- Dead-letter rows retain attempt count, timestamps and a sanitized error.
+- `POST /v1/jobs/{id}/replay` returns an eligible dead job to `retry_wait`,
+  resets attempts and records `replay_count`, `replayed_by` and `replayed_at`.
 
 ## What works in Phase 1
 
@@ -110,6 +119,7 @@ Expected response: `202 Accepted` with a `Location` header and a body such as:
   "run_at": "2026-11-15T09:00:00Z",
   "attempts": 0,
   "max_attempts": 5,
+  "replay_count": 0,
   "created_at": "2026-11-15T09:00:00Z",
   "updated_at": "2026-11-15T09:00:00Z"
 }
@@ -155,11 +165,27 @@ LIMIT 1;
 ```
 
 The claim increments `attempts`, records `locked_by`, `lease_token`,
-`locked_until` and `started_at`, and returns the job while committing the claim.
-No row lock is held while the handler runs. A successful handler writes
-`succeeded` plus `result`; a failed handler writes `retry_wait` and a future
-`run_at`, or `dead` once attempts are exhausted. Both writes require the current
-lease token, so a worker that lost its lease cannot overwrite a newer attempt.
+`locked_until`, `heartbeat_at` and `started_at`, and returns the job while
+committing the claim. No row lock is held while the handler runs.
+
+While a handler runs, the worker renews `locked_until` every
+`HEARTBEAT_INTERVAL`. A zero-row heartbeat means another worker owns the job, so
+the handler context is cancelled and its result is discarded. Success and failure
+writes use the same lease-token condition, which fences a stale worker after one
+expired lease has been recovered.
+
+A failed handler is classified:
+
+- transient, cancelled and unknown failures retry with
+  `random(0, min(RETRY_BASE_DELAY * 2^(attempt-1), RETRY_MAX_DELAY))`;
+- permanent failures and exhausted attempts become `dead` immediately;
+- the sanitized error, attempt count and timestamps remain on the row.
+
+A separate recovery loop runs every `RECOVERY_INTERVAL` inside each worker. It
+finds `running` rows with `locked_until < now()`, takes them with
+`FOR UPDATE SKIP LOCKED`, and returns them to `retry_wait` or `dead` according to
+their attempt count. The scan and update are one statement, so several workers
+can run recovery concurrently without stealing the same row.
 
 Observe a job after submitting it:
 
@@ -169,7 +195,18 @@ curl http://localhost:8080/v1/jobs/<job-id> \
 ```
 
 The response moves from `queued` to `running` and then to `succeeded` or
-`retry_wait`. Inspect the durable row directly for internal fields:
+`retry_wait`. Replay a dead job:
+
+```bash
+curl -X POST http://localhost:8080/v1/jobs/<job-id>/replay \
+  -H "X-Tenant-ID: $TENANT_ID"
+```
+
+Only `dead` jobs are eligible. A replay returns the job with `status=retry_wait`,
+`attempts=0` and an incremented `replay_count`; replaying any other status
+returns `409`, and another tenant's job returns `404`.
+
+Inspect the durable row directly for internal fields:
 
 ```bash
 docker compose exec postgres psql -U jobs -d jobs \
@@ -197,14 +234,16 @@ records a retry for work that could not finish.
 | `WORKER_CONCURRENCY` | `4` | Maximum jobs a worker executes simultaneously |
 | `POLL_INTERVAL` | `1s` | Delay between claim attempts when no job is ready |
 | `LEASE_DURATION` | `60s` | Claim lease recorded in `locked_until` |
-| `HEARTBEAT_INTERVAL` | `15s` | Reserved for Phase 4 lease heartbeats |
+| `HEARTBEAT_INTERVAL` | `15s` | Lease renewal cadence while a handler runs |
 | `HANDLER_TIMEOUT` | `30s` | Per-handler execution deadline |
-| `RETRY_BASE_DELAY` | `5s` | Delay before a failed job becomes eligible again |
+| `RETRY_BASE_DELAY` | `5s` | First-attempt backoff ceiling |
+| `RETRY_MAX_DELAY` | `15m` | Maximum exponential backoff ceiling |
+| `RECOVERY_INTERVAL` | `30s` | Background expired-lease scan cadence |
 | `MAX_ATTEMPTS` | `5` | Default maximum attempts per job |
 | `MAX_PAYLOAD_BYTES` | `262144` | Maximum JSON payload size |
 
-`LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`, and `HANDLER_TIMEOUT`
-must not exceed `LEASE_DURATION`.
+`LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`. `HANDLER_TIMEOUT` may
+exceed the lease because heartbeats keep the lease alive for the whole handler.
 
 ## Database migrations
 
@@ -219,7 +258,8 @@ go run ./cmd/migrate
 
 `migrations/0001_create_jobs.sql` creates the documented `job_status` enum, the
 `jobs` table, validation constraints and the ready/lease/tenant/idempotency
-indexes.
+indexes. `migrations/0002_add_replay_audit.sql` adds the durable
+`replay_count`, `replayed_by` and `replayed_at` audit columns.
 
 ## Tests
 
@@ -247,7 +287,14 @@ The integration suite verifies:
 - priority/run-at ordering and skip rules are honoured;
 - completions and failures are fenced by the lease token;
 - handlers move jobs through success, retry and dead-letter states;
-- worker concurrency stays bounded and graceful shutdown drains in flight work.
+- worker concurrency stays bounded and graceful shutdown drains in flight work;
+- heartbeats keep a long-running handler's lease alive beyond its original
+  expiry, while recovery leaves live leases alone;
+- expired leases are requeued or dead-lettered according to attempts;
+- permanent failures dead-letter immediately and transient failures schedule a
+  jittered retry;
+- replay moves a dead job back to `retry_wait`, resets attempts, records the
+  audit columns and rejects non-dead or cross-tenant jobs.
 
 Phase 2–3 claim and concurrency tests run in throwaway PostgreSQL schemas, so
 they do not depend on or disturb development data. Integration tests are skipped
@@ -265,7 +312,8 @@ internal/jobs/           Repository interface, validator and service
 internal/postgres/       Pool, migrations, repositories, transactions
 internal/handlers/       Handler registry and built-in job handlers
 internal/queue/          Queue store contract used by the worker
-internal/worker/         Claim loops, dispatch, timeout and shutdown runtime
+internal/retry/          Failure classification and jittered backoff policy
+internal/worker/         Claim loops, heartbeats, recovery, dispatch and shutdown
 internal/transport/http/ Router, handlers, DTOs and middleware
 migrations/              Embedded versioned SQL migrations
 tests/integration/       PostgreSQL-backed API and worker tests
@@ -279,8 +327,8 @@ docs/architecture/       Architecture blueprint and diagrams
 | 1 — Job submission and persistence | Implemented |
 | 2 — First worker | Implemented |
 | 3 — Concurrency and bounded pool | Implemented with Phase 2 |
-| 4 — Leases, heartbeat and recovery | Planned |
-| 5 — Retry and dead-letter | Planned |
+| 4 — Leases, heartbeat and recovery | Implemented with Phase 3 |
+| 5 — Retry, dead-letter and replay | Implemented with Phase 3 |
 | 6 — Authentication and tenant hardening | Planned |
 | 7 — Observability | Planned |
 | 8 — Containers and CI | Planned |

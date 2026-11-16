@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/google/uuid"
@@ -34,7 +35,10 @@ const jobColumns = `
 	created_at,
 	updated_at,
 	started_at,
-	finished_at
+	finished_at,
+	replay_count,
+	replayed_by,
+	replayed_at
 `
 
 // JobRepository is the PostgreSQL implementation of jobs.Repository.
@@ -111,6 +115,54 @@ func (r *JobRepository) GetJobByID(ctx context.Context, tenantID, id uuid.UUID) 
 	return job, nil
 }
 
+// ReplayJob returns a dead job to retry_wait for an operator. Only a dead job
+// owned by tenantID is eligible; attempts reset to zero and the durable audit
+// columns record who replayed it and when.
+func (r *JobRepository) ReplayJob(ctx context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error) {
+	if tenantID == uuid.Nil || id == uuid.Nil {
+		return nil, fmt.Errorf("%w: tenant id and job id are required", domain.ErrInvalidArgument)
+	}
+	replayedBy = strings.TrimSpace(replayedBy)
+	if replayedBy == "" {
+		return nil, fmt.Errorf("%w: replayed_by is required", domain.ErrInvalidArgument)
+	}
+
+	const query = `
+		UPDATE jobs
+		SET status       = 'retry_wait',
+		    attempts     = 0,
+		    run_at       = now(),
+		    last_error   = NULL,
+		    finished_at  = NULL,
+		    locked_by    = NULL,
+		    lease_token  = NULL,
+		    locked_until = NULL,
+		    heartbeat_at = NULL,
+		    replay_count = replay_count + 1,
+		    replayed_by  = $3,
+		    replayed_at  = now(),
+		    updated_at   = now()
+		WHERE id = $1
+		  AND tenant_id = $2
+		  AND status = 'dead'
+		RETURNING ` + jobColumns
+
+	job, err := scanJob(r.pool.QueryRow(ctx, query, id.String(), tenantID.String(), replayedBy))
+	if err == nil {
+		return job, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("replay job: %w", err)
+	}
+
+	// No row was updated. Distinguish an unknown tenant-scoped job from a job
+	// that exists but is not dead so the transport can return 404 or 409.
+	if _, getErr := r.GetJobByID(ctx, tenantID, id); getErr != nil {
+		return nil, getErr
+	}
+	return nil, fmt.Errorf("%w: only dead jobs can be replayed", domain.ErrInvalidTransition)
+}
+
 func (r *JobRepository) getByIdempotencyKey(ctx context.Context, tenantID uuid.UUID, key string) (*domain.Job, error) {
 	query := `SELECT ` + jobColumns + ` FROM jobs WHERE tenant_id = $1 AND idempotency_key = $2`
 	job, err := scanJob(r.pool.QueryRow(ctx, query, tenantID.String(), key))
@@ -155,6 +207,9 @@ func scanJob(row pgx.Row) (*domain.Job, error) {
 		&job.UpdatedAt,
 		&job.StartedAt,
 		&job.FinishedAt,
+		&job.ReplayCount,
+		&job.ReplayedBy,
+		&job.ReplayedAt,
 	)
 	if err != nil {
 		return nil, err

@@ -23,6 +23,11 @@ type fakeRepository struct {
 	getErr    error
 	gotTenant uuid.UUID
 	gotID     uuid.UUID
+
+	replayCalls   int
+	replayJob     *domain.Job
+	replayErr     error
+	gotReplayedBy string
 }
 
 func (f *fakeRepository) CreateJob(_ context.Context, job *domain.Job) (*domain.Job, bool, error) {
@@ -42,6 +47,14 @@ func (f *fakeRepository) GetJobByID(_ context.Context, tenantID, id uuid.UUID) (
 	f.gotTenant = tenantID
 	f.gotID = id
 	return f.getJob, f.getErr
+}
+
+func (f *fakeRepository) ReplayJob(_ context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error) {
+	f.replayCalls++
+	f.gotTenant = tenantID
+	f.gotID = id
+	f.gotReplayedBy = replayedBy
+	return f.replayJob, f.replayErr
 }
 
 func TestServiceSubmit(t *testing.T) {
@@ -148,5 +161,71 @@ func TestServiceGetPropagatesNotFound(t *testing.T) {
 	_, err := service.Get(context.Background(), uuid.New(), uuid.New())
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("Get() error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestServiceReplay(t *testing.T) {
+	tenantID := uuid.New()
+	jobID := uuid.New()
+	want := &domain.Job{
+		ID:          jobID,
+		TenantID:    tenantID,
+		Status:      domain.StatusRetryWait,
+		ReplayCount: 1,
+	}
+	repo := &fakeRepository{replayJob: want}
+	service := NewService(repo, testValidator())
+
+	got, err := service.Replay(context.Background(), tenantID, jobID, "operator-1")
+	if err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if got != want {
+		t.Error("Replay() returned unexpected job")
+	}
+	if repo.replayCalls != 1 {
+		t.Errorf("ReplayJob calls = %d, want 1", repo.replayCalls)
+	}
+	if repo.gotTenant != tenantID || repo.gotID != jobID {
+		t.Errorf("repository got tenant/id = %v/%v, want %v/%v", repo.gotTenant, repo.gotID, tenantID, jobID)
+	}
+	if repo.gotReplayedBy != "operator-1" {
+		t.Errorf("replayed_by = %q, want operator-1", repo.gotReplayedBy)
+	}
+}
+
+func TestServiceReplayRejectsInvalidInput(t *testing.T) {
+	repo := &fakeRepository{}
+	service := NewService(repo, testValidator())
+
+	tests := []struct {
+		name       string
+		tenantID   uuid.UUID
+		id         uuid.UUID
+		replayedBy string
+	}{
+		{"nil tenant", uuid.Nil, uuid.New(), "operator"},
+		{"nil job", uuid.New(), uuid.Nil, "operator"},
+		{"blank actor", uuid.New(), uuid.New(), "   "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := service.Replay(context.Background(), tt.tenantID, tt.id, tt.replayedBy); !errors.Is(err, domain.ErrInvalidArgument) {
+				t.Errorf("Replay() error = %v, want ErrInvalidArgument", err)
+			}
+		})
+	}
+	if repo.replayCalls != 0 {
+		t.Errorf("invalid calls reached the repository %d times", repo.replayCalls)
+	}
+}
+
+func TestServiceReplayPropagatesInvalidTransition(t *testing.T) {
+	repo := &fakeRepository{replayErr: domain.ErrInvalidTransition}
+	service := NewService(repo, testValidator())
+
+	_, err := service.Replay(context.Background(), uuid.New(), uuid.New(), "operator")
+	if !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("Replay() error = %v, want ErrInvalidTransition", err)
 	}
 }

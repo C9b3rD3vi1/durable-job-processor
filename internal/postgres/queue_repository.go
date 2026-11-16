@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/queue"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -151,4 +152,95 @@ func (r *JobRepository) FailJob(ctx context.Context, id, leaseToken uuid.UUID, c
 		return false, fmt.Errorf("fail job: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+// HeartbeatJob renews the lease only while the caller still holds it. A zero
+// rows-affected result is the fencing signal that the worker has lost
+// ownership and must stop state changes for this attempt.
+func (r *JobRepository) HeartbeatJob(ctx context.Context, id, leaseToken uuid.UUID, leaseDuration time.Duration) (bool, error) {
+	if id == uuid.Nil || leaseToken == uuid.Nil {
+		return false, fmt.Errorf("%w: job id and lease token are required", domain.ErrInvalidArgument)
+	}
+	if leaseDuration <= 0 {
+		return false, fmt.Errorf("%w: lease duration must be positive", domain.ErrInvalidArgument)
+	}
+
+	const query = `
+		UPDATE jobs
+		SET locked_until = now() + make_interval(secs => $1),
+		    heartbeat_at = now(),
+		    updated_at   = now()
+		WHERE id = $2
+		  AND status = 'running'
+		  AND lease_token = $3`
+
+	tag, err := r.pool.Exec(ctx, query,
+		leaseDuration.Seconds(),
+		id.String(),
+		leaseToken.String(),
+	)
+	if err != nil {
+		return false, fmt.Errorf("heartbeat job: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// RecoverExpiredJobs resolves running jobs whose lease has expired. The scan
+// and update are one statement, so several workers can run recovery without
+// claiming the same abandoned row twice. Attempts are not incremented here;
+// the next claim does that. A job that already consumed its attempts is
+// dead-lettered with a safe diagnostic message.
+func (r *JobRepository) RecoverExpiredJobs(ctx context.Context, limit int) (queue.RecoveryResult, error) {
+	if limit <= 0 {
+		return queue.RecoveryResult{}, fmt.Errorf("%w: recovery limit must be positive", domain.ErrInvalidArgument)
+	}
+
+	const query = `
+		WITH expired AS (
+			SELECT id
+			FROM jobs
+			WHERE status = 'running'
+			  AND (locked_until IS NULL OR locked_until < now())
+			ORDER BY locked_until ASC NULLS FIRST
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		),
+		updated AS (
+			UPDATE jobs AS j
+			SET status = CASE
+			        WHEN j.attempts >= j.max_attempts THEN 'dead'::job_status
+			        ELSE 'retry_wait'::job_status
+			    END,
+			    run_at = CASE
+			        WHEN j.attempts >= j.max_attempts THEN j.run_at
+			        ELSE now()
+			    END,
+			    finished_at = CASE
+			        WHEN j.attempts >= j.max_attempts THEN now()
+			        ELSE NULL
+			    END,
+			    last_error = CASE
+			        WHEN j.attempts >= j.max_attempts
+			            THEN 'lease expired after maximum attempts'
+			        ELSE 'lease expired; requeued for retry'
+			    END,
+			    updated_at   = now(),
+			    locked_by    = NULL,
+			    lease_token  = NULL,
+			    locked_until = NULL,
+			    heartbeat_at = NULL
+			FROM expired
+			WHERE j.id = expired.id
+			RETURNING j.status::text AS status
+		)
+		SELECT
+			count(*) FILTER (WHERE status = 'retry_wait'),
+			count(*) FILTER (WHERE status = 'dead')
+		FROM updated`
+
+	var requeued, dead int64
+	if err := r.pool.QueryRow(ctx, query, limit).Scan(&requeued, &dead); err != nil {
+		return queue.RecoveryResult{}, fmt.Errorf("recover expired jobs: %w", err)
+	}
+	return queue.RecoveryResult{Requeued: int(requeued), Dead: int(dead)}, nil
 }

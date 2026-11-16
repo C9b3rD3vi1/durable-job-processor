@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/retry"
 )
 
 func testJob(jobType, payload string) domain.Job {
@@ -216,6 +217,24 @@ func TestWebhookDeliverHandlerFailureIsSanitized(t *testing.T) {
 	if strings.Contains(err.Error(), "secret upstream details") {
 		t.Errorf("error leaked response body: %q", err)
 	}
+	if class := retry.Classify(err); class != retry.ClassTransient {
+		t.Errorf("classification = %v, want transient", class)
+	}
+}
+
+func TestWebhookDeliverHandlerClientErrorIsPermanent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	_, err := (&WebhookDeliverHandler{}).Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
+	if err == nil {
+		t.Fatal("Execute() error = nil, want error")
+	}
+	if class := retry.Classify(err); class != retry.ClassPermanent {
+		t.Errorf("classification = %v, want permanent", class)
+	}
 }
 
 func TestWebhookDeliverHandlerValidation(t *testing.T) {
@@ -250,5 +269,8 @@ func TestWebhookDeliverHandlerTimeout(t *testing.T) {
 	_, err := handler.Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
 	if err == nil || !strings.Contains(err.Error(), "request failed") {
 		t.Fatalf("Execute() error = %v, want sanitized request failure", err)
+	}
+	if class := retry.Classify(err); class != retry.ClassTransient {
+		t.Errorf("classification = %v, want transient", class)
 	}
 }

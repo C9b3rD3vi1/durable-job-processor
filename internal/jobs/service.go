@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
@@ -54,4 +55,23 @@ func (s *Service) Get(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job,
 		return nil, fmt.Errorf("%w: job id is required", domain.ErrInvalidArgument)
 	}
 	return s.repo.GetJobByID(ctx, tenantID, id)
+}
+
+// Replay returns an eligible dead job to retry_wait. replayedBy is the operator
+// identity recorded by the durable audit columns.
+func (s *Service) Replay(ctx context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error) {
+	if s.repo == nil {
+		return nil, fmt.Errorf("job repository is not configured")
+	}
+	if tenantID == uuid.Nil {
+		return nil, fmt.Errorf("%w: tenant_id is required", domain.ErrInvalidArgument)
+	}
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("%w: job id is required", domain.ErrInvalidArgument)
+	}
+	replayedBy = strings.TrimSpace(replayedBy)
+	if replayedBy == "" {
+		return nil, fmt.Errorf("%w: replayed_by is required", domain.ErrInvalidArgument)
+	}
+	return s.repo.ReplayJob(ctx, tenantID, id, replayedBy)
 }

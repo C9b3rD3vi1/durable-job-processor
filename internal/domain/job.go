@@ -42,6 +42,10 @@ type Job struct {
 	Result    json.RawMessage `json:"result,omitempty"`
 	LastError *string         `json:"last_error,omitempty"`
 
+	ReplayCount int        `json:"replay_count,omitempty"`
+	ReplayedBy  *string    `json:"replayed_by,omitempty"`
+	ReplayedAt  *time.Time `json:"replayed_at,omitempty"`
+
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`

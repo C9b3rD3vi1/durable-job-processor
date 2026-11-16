@@ -25,6 +25,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("HEARTBEAT_INTERVAL", "10s")
 	t.Setenv("HANDLER_TIMEOUT", "45s")
 	t.Setenv("RETRY_BASE_DELAY", "4s")
+	t.Setenv("RETRY_MAX_DELAY", "2m")
+	t.Setenv("RECOVERY_INTERVAL", "45s")
 	t.Setenv("MAX_ATTEMPTS", "7")
 	t.Setenv("MAX_PAYLOAD_BYTES", "1024")
 }
@@ -60,6 +62,9 @@ func TestLoad(t *testing.T) {
 	}
 	if cfg.HandlerTimeout != 45*time.Second || cfg.RetryBaseDelay != 4*time.Second {
 		t.Errorf("handler config = %v/%v, want 45s/4s", cfg.HandlerTimeout, cfg.RetryBaseDelay)
+	}
+	if cfg.RetryMaxDelay != 2*time.Minute || cfg.RecoveryInterval != 45*time.Second {
+		t.Errorf("retry/recovery config = %v/%v, want 2m/45s", cfg.RetryMaxDelay, cfg.RecoveryInterval)
 	}
 	if cfg.MaxAttempts != 7 || cfg.MaxPayloadBytes != 1024 {
 		t.Errorf("limits = %d/%d, want 7/1024", cfg.MaxAttempts, cfg.MaxPayloadBytes)
@@ -102,18 +107,40 @@ func TestLoadRejectsUnsafeLease(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsHandlerTimeoutBeyondLease(t *testing.T) {
+func TestLoadAllowsHandlerTimeoutBeyondLease(t *testing.T) {
 	setBaseEnv(t)
-	t.Setenv("HANDLER_TIMEOUT", "91s")
+	// Heartbeats renew the lease while the handler runs, so handler runtime is
+	// no longer bounded by the lease duration.
+	t.Setenv("LEASE_DURATION", "30s")
+	t.Setenv("HEARTBEAT_INTERVAL", "10s")
+	t.Setenv("HANDLER_TIMEOUT", "2m")
 
-	if _, err := config.Load(); err == nil {
-		t.Fatal("Load() error = nil, want error")
+	if _, err := config.Load(); err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
 	}
 }
 
 func TestLoadRejectsNonPositiveRetryDelay(t *testing.T) {
 	setBaseEnv(t)
 	t.Setenv("RETRY_BASE_DELAY", "0s")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want error")
+	}
+}
+
+func TestLoadRejectsNonPositiveRetryMaxDelay(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("RETRY_MAX_DELAY", "0s")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want error")
+	}
+}
+
+func TestLoadRejectsNonPositiveRecoveryInterval(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("RECOVERY_INTERVAL", "0s")
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("Load() error = nil, want error")

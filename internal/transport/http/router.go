@@ -38,6 +38,7 @@ func NewRouter(opts Options) http.Handler {
 
 	mux.Handle("POST /v1/jobs", middleware.RequireTenant(http.HandlerFunc(jobsHandler.CreateJob)))
 	mux.Handle("GET /v1/jobs/{id}", middleware.RequireTenant(http.HandlerFunc(jobsHandler.GetJob)))
+	mux.Handle("POST /v1/jobs/{id}/replay", middleware.RequireTenant(http.HandlerFunc(jobsHandler.ReplayJob)))
 
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

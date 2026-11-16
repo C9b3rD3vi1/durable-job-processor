@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/retry"
 )
 
 const (
@@ -170,13 +171,24 @@ func (h *WebhookDeliverHandler) Execute(ctx context.Context, job domain.Job) (js
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.New("webhook.deliver request failed")
+		// Network failures and request timeouts are worth another attempt.
+		return nil, retry.Transient(errors.New("webhook.deliver request failed"))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, webhookResponseLimit))
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("webhook.deliver returned HTTP %d", resp.StatusCode)
+		statusErr := fmt.Errorf("webhook.deliver returned HTTP %d", resp.StatusCode)
+		switch {
+		case resp.StatusCode >= http.StatusInternalServerError:
+			return nil, retry.Transient(statusErr)
+		case resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError:
+			return nil, retry.Permanent(statusErr)
+		default:
+			// A non-2xx response outside the 4xx/5xx ranges (for example an
+			// unfollowed redirect) will not improve by repeating the request.
+			return nil, retry.Permanent(statusErr)
+		}
 	}
 
 	return json.Marshal(map[string]any{

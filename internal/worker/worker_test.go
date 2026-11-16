@@ -14,6 +14,7 @@ import (
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/queue"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/retry"
 	"github.com/google/uuid"
 )
 
@@ -36,15 +37,24 @@ type fakeStore struct {
 	failOK      bool
 	completeErr error
 	failErr     error
+
+	heartbeatCalls int
+	heartbeatOK    bool
+	heartbeatErr   error
+
+	recoveryCalls  int
+	recoveryResult queue.RecoveryResult
+	recoveryErr    error
 }
 
 func newFakeStore(jobs ...*domain.Job) *fakeStore {
 	return &fakeStore{
-		jobs:       jobs,
-		completed:  make(map[uuid.UUID]json.RawMessage),
-		failed:     make(map[uuid.UUID]failureRecord),
-		completeOK: true,
-		failOK:     true,
+		jobs:        jobs,
+		completed:   make(map[uuid.UUID]json.RawMessage),
+		failed:      make(map[uuid.UUID]failureRecord),
+		completeOK:  true,
+		failOK:      true,
+		heartbeatOK: true,
 	}
 }
 
@@ -96,6 +106,43 @@ func (s *fakeStore) FailJob(_ context.Context, id, _ uuid.UUID, cause string, de
 	}
 	s.failed[id] = failureRecord{cause: cause, delay: delay}
 	return true, nil
+}
+
+func (s *fakeStore) HeartbeatJob(_ context.Context, _, _ uuid.UUID, _ time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.heartbeatErr != nil {
+		return false, s.heartbeatErr
+	}
+	s.heartbeatCalls++
+	if !s.heartbeatOK {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *fakeStore) RecoverExpiredJobs(_ context.Context, _ int) (queue.RecoveryResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.recoveryCalls++
+	if s.recoveryErr != nil {
+		return queue.RecoveryResult{}, s.recoveryErr
+	}
+	return s.recoveryResult, nil
+}
+
+func (s *fakeStore) heartbeatCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.heartbeatCalls
+}
+
+func (s *fakeStore) recoveryCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recoveryCalls
 }
 
 func (s *fakeStore) completedCount() int {
@@ -234,8 +281,17 @@ func TestNewDefaultsAndValidation(t *testing.T) {
 	if runner.handlerTimeout != defaultHandlerTimeout {
 		t.Errorf("handler timeout = %v, want %v", runner.handlerTimeout, defaultHandlerTimeout)
 	}
+	if runner.heartbeatInterval != defaultHeartbeatInterval {
+		t.Errorf("heartbeat interval = %v, want %v", runner.heartbeatInterval, defaultHeartbeatInterval)
+	}
 	if runner.retryBaseDelay != defaultRetryBaseDelay {
 		t.Errorf("retry base delay = %v, want %v", runner.retryBaseDelay, defaultRetryBaseDelay)
+	}
+	if runner.retryPolicy.MaxDelay != defaultRetryMaxDelay {
+		t.Errorf("retry max delay = %v, want %v", runner.retryPolicy.MaxDelay, defaultRetryMaxDelay)
+	}
+	if runner.recoveryInterval != defaultRecoveryInterval {
+		t.Errorf("recovery interval = %v, want %v", runner.recoveryInterval, defaultRecoveryInterval)
 	}
 
 	tests := []struct {
@@ -246,10 +302,10 @@ func TestNewDefaultsAndValidation(t *testing.T) {
 		{"missing registry", Config{Store: store, WorkerID: "w"}},
 		{"missing worker id", Config{Store: store, Registry: registry}},
 		{
-			"handler timeout exceeds lease",
+			"heartbeat interval not less than lease",
 			Config{
 				Store: store, Registry: registry, WorkerID: "w",
-				LeaseDuration: time.Second, HandlerTimeout: 2 * time.Second,
+				LeaseDuration: time.Second, HeartbeatInterval: time.Second,
 			},
 		},
 	}
@@ -292,6 +348,7 @@ func TestProcessHandlerErrorSchedulesRetry(t *testing.T) {
 	runner := newRunner(t, store, registry, func(cfg *Config) {
 		cfg.RetryBaseDelay = 2 * time.Second
 	})
+	runner.jitter = func() float64 { return 1 }
 	job := testJob("test.fail", 1, 3)
 
 	runner.process(context.Background(), job)
@@ -309,6 +366,164 @@ func TestProcessHandlerErrorSchedulesRetry(t *testing.T) {
 	if _, completed := store.completion(job.ID); completed {
 		t.Error("failed job was recorded as completed")
 	}
+}
+
+func TestProcessRenewsLeaseWhileHandlerRuns(t *testing.T) {
+	store := newFakeStore()
+	registry := registryWith(t, "test.slow", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		time.Sleep(40 * time.Millisecond)
+		return json.RawMessage(`{"ok":true}`), nil
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.LeaseDuration = time.Second
+		cfg.HeartbeatInterval = 5 * time.Millisecond
+		cfg.HandlerTimeout = time.Second
+	})
+
+	runner.process(context.Background(), testJob("test.slow", 1, 3))
+
+	if store.heartbeatCount() == 0 {
+		t.Error("running handler did not renew its lease")
+	}
+	if store.completedCount() != 1 {
+		t.Errorf("completed %d jobs, want 1", store.completedCount())
+	}
+}
+
+func TestProcessStopsWhenLeaseIsLost(t *testing.T) {
+	store := newFakeStore()
+	store.heartbeatOK = false
+
+	started := make(chan struct{})
+	registry := registryWith(t, "test.lost", handlers.HandlerFunc(func(ctx context.Context, _ domain.Job) (json.RawMessage, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.LeaseDuration = time.Second
+		cfg.HeartbeatInterval = 5 * time.Millisecond
+		cfg.HandlerTimeout = 2 * time.Second
+	})
+
+	done := make(chan struct{})
+	go func() {
+		runner.process(context.Background(), testJob("test.lost", 1, 3))
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("process did not stop after losing the lease")
+	}
+
+	if store.heartbeatCount() == 0 {
+		t.Error("lease ownership was never checked")
+	}
+	if store.completedCount() != 0 || store.failedCount() != 0 {
+		t.Error("a worker that lost its lease wrote job state")
+	}
+}
+
+func TestProcessPermanentFailureDeadLetters(t *testing.T) {
+	store := newFakeStore()
+	registry := registryWith(t, "test.permanent", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		return nil, retry.Permanent(errors.New("bad input"))
+	}))
+	runner := newRunner(t, store, registry, nil)
+	job := testJob("test.permanent", 1, 5)
+
+	runner.process(context.Background(), job)
+
+	record, ok := store.failure(job.ID)
+	if !ok {
+		t.Fatal("permanent failure was not recorded")
+	}
+	if record.delay != 0 {
+		t.Errorf("retry delay = %v, want 0 (dead-letter)", record.delay)
+	}
+	if record.cause != "bad input" {
+		t.Errorf("cause = %q, want bad input", record.cause)
+	}
+}
+
+func TestProcessExhaustedAttemptsDeadLetters(t *testing.T) {
+	store := newFakeStore()
+	registry := registryWith(t, "test.exhausted", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		return nil, errors.New("still failing")
+	}))
+	runner := newRunner(t, store, registry, nil)
+	job := testJob("test.exhausted", 3, 3)
+
+	runner.process(context.Background(), job)
+
+	record, ok := store.failure(job.ID)
+	if !ok {
+		t.Fatal("exhausted failure was not recorded")
+	}
+	if record.delay != 0 {
+		t.Errorf("retry delay = %v, want 0 (dead-letter)", record.delay)
+	}
+}
+
+func TestRetryDelayUsesFullJitterAndCap(t *testing.T) {
+	runner := newRunner(t, newFakeStore(), handlers.New(), func(cfg *Config) {
+		cfg.RetryBaseDelay = time.Second
+		cfg.RetryMaxDelay = 3 * time.Second
+	})
+	runner.jitter = func() float64 { return 1 }
+
+	for attempt, want := range map[int]time.Duration{
+		1:  1 * time.Second,
+		2:  2 * time.Second,
+		3:  3 * time.Second,
+		10: 3 * time.Second,
+	} {
+		if got := runner.retryDelay(attempt); got != want {
+			t.Errorf("retryDelay(%d) = %v, want %v", attempt, got, want)
+		}
+	}
+
+	runner.jitter = func() float64 { return 0 }
+	if got := runner.retryDelay(2); got != 0 {
+		t.Errorf("zero jitter retryDelay(2) = %v, want 0", got)
+	}
+}
+
+func TestRecoveryLoopRunsPeriodically(t *testing.T) {
+	store := newFakeStore()
+	store.recoveryResult = queue.RecoveryResult{Requeued: 1, Dead: 1}
+	runner := newRunner(t, store, handlers.New(), func(cfg *Config) {
+		cfg.RecoveryInterval = 5 * time.Millisecond
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	waitFor(t, time.Second, func() bool { return store.recoveryCount() >= 2 })
+	stopRunner(t, cancel, done)
+}
+
+func TestRecoveryLoopSurvivesErrors(t *testing.T) {
+	store := newFakeStore()
+	store.recoveryErr = errors.New("database unavailable")
+	runner := newRunner(t, store, handlers.New(), func(cfg *Config) {
+		cfg.RecoveryInterval = 5 * time.Millisecond
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+
+	waitFor(t, time.Second, func() bool { return store.recoveryCount() >= 2 })
+	stopRunner(t, cancel, done)
 }
 
 func TestProcessUnknownHandlerDeadLetters(t *testing.T) {
@@ -540,12 +755,13 @@ func TestRunShutdownTimeoutCancelsHandlers(t *testing.T) {
 		return nil, ctx.Err()
 	}))
 
-	store := newFakeStore(testJob("test.block", 1, 3))
+	store := newFakeStore(testJob("test.block", 0, 3))
 	runner := newRunner(t, store, registry, func(cfg *Config) {
 		cfg.HandlerTimeout = 5 * time.Second
 		cfg.ShutdownTimeout = 30 * time.Millisecond
 		cfg.RetryBaseDelay = 2 * time.Second
 	})
+	runner.jitter = func() float64 { return 1 }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

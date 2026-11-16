@@ -28,6 +28,10 @@ type fakeService struct {
 	getErr    error
 	gotTenant uuid.UUID
 	gotID     uuid.UUID
+
+	replayJob     *domain.Job
+	replayErr     error
+	gotReplayedBy string
 }
 
 func (f *fakeService) Submit(_ context.Context, in jobs.SubmitInput) (*domain.Job, bool, error) {
@@ -39,6 +43,13 @@ func (f *fakeService) Get(_ context.Context, tenantID, id uuid.UUID) (*domain.Jo
 	f.gotTenant = tenantID
 	f.gotID = id
 	return f.getJob, f.getErr
+}
+
+func (f *fakeService) Replay(_ context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error) {
+	f.gotTenant = tenantID
+	f.gotID = id
+	f.gotReplayedBy = replayedBy
+	return f.replayJob, f.replayErr
 }
 
 type fakePinger struct{ err error }
@@ -161,6 +172,100 @@ func TestGetJobNotFound(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestReplayJob(t *testing.T) {
+	tenantID := uuid.New()
+	job := sampleJob(tenantID)
+	job.Status = domain.StatusRetryWait
+	job.Attempts = 0
+	job.ReplayCount = 1
+	service := &fakeService{replayJob: job}
+	router := testRouter(service, fakePinger{}, 1<<20)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/replay", nil)
+	req.Header.Set("X-Tenant-ID", tenantID.String())
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if service.gotTenant != tenantID || service.gotID != job.ID {
+		t.Errorf("service got %v/%v, want %v/%v", service.gotTenant, service.gotID, tenantID, job.ID)
+	}
+	if service.gotReplayedBy != tenantID.String() {
+		t.Errorf("replayed_by = %q, want %q", service.gotReplayedBy, tenantID.String())
+	}
+
+	var response dto.JobResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Status != domain.StatusRetryWait || response.ReplayCount != 1 {
+		t.Errorf("response = %+v, want retry_wait with replay_count 1", response)
+	}
+}
+
+func TestReplayJobRejectsNonDeadJob(t *testing.T) {
+	tenantID := uuid.New()
+	job := sampleJob(tenantID)
+	service := &fakeService{replayErr: domain.ErrInvalidTransition}
+	router := testRouter(service, fakePinger{}, 1<<20)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/replay", nil)
+	req.Header.Set("X-Tenant-ID", tenantID.String())
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "invalid_transition" {
+		t.Errorf("error code = %q, want invalid_transition", response.Error.Code)
+	}
+}
+
+func TestReplayJobNotFound(t *testing.T) {
+	tenantID := uuid.New()
+	service := &fakeService{replayErr: domain.ErrNotFound}
+	router := testRouter(service, fakePinger{}, 1<<20)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+uuid.New().String()+"/replay", nil)
+	req.Header.Set("X-Tenant-ID", tenantID.String())
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestReplayJobRequiresTenant(t *testing.T) {
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+uuid.New().String()+"/replay", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestReplayJobRejectsInvalidID(t *testing.T) {
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/not-a-uuid/replay", nil)
+	req.Header.Set("X-Tenant-ID", uuid.New().String())
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
 
