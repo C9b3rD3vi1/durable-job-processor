@@ -49,6 +49,7 @@ var allowedTransitions = map[JobStatus]map[JobStatus]struct{}{
 		StatusSucceeded: {},
 		StatusRetryWait: {},
 		StatusDead:      {},
+		StatusCancelled: {},
 	},
 	StatusDead: {
 		StatusRetryWait: {},

@@ -12,11 +12,12 @@ import (
 )
 
 type fakeRepository struct {
-	createCalls int
-	createJob   *domain.Job
-	createNew   bool
-	createErr   error
-	gotJob      *domain.Job
+	createCalls    int
+	createJob      *domain.Job
+	createNew      bool
+	createErr      error
+	gotJob         *domain.Job
+	gotMaxOutstand int
 
 	getCalls  int
 	getJob    *domain.Job
@@ -24,15 +25,30 @@ type fakeRepository struct {
 	gotTenant uuid.UUID
 	gotID     uuid.UUID
 
+	listCalls  int
+	listJobs   []*domain.Job
+	listErr    error
+	gotFilter  ListFilter
+	gotLimit   int
+	gotListTen uuid.UUID
+
+	cancelCalls  int
+	cancelJob    *domain.Job
+	cancelReq    bool
+	cancelErr    error
+	gotCancelTan uuid.UUID
+	gotCancelID  uuid.UUID
+
 	replayCalls   int
 	replayJob     *domain.Job
 	replayErr     error
 	gotReplayedBy string
 }
 
-func (f *fakeRepository) CreateJob(_ context.Context, job *domain.Job) (*domain.Job, bool, error) {
+func (f *fakeRepository) CreateJob(_ context.Context, job *domain.Job, maxOutstanding int) (*domain.Job, bool, error) {
 	f.createCalls++
 	f.gotJob = job
+	f.gotMaxOutstand = maxOutstanding
 	if f.createErr != nil {
 		return nil, false, f.createErr
 	}
@@ -47,6 +63,21 @@ func (f *fakeRepository) GetJobByID(_ context.Context, tenantID, id uuid.UUID) (
 	f.gotTenant = tenantID
 	f.gotID = id
 	return f.getJob, f.getErr
+}
+
+func (f *fakeRepository) ListJobs(_ context.Context, tenantID uuid.UUID, filter ListFilter, limit int) ([]*domain.Job, error) {
+	f.listCalls++
+	f.gotListTen = tenantID
+	f.gotFilter = filter
+	f.gotLimit = limit
+	return f.listJobs, f.listErr
+}
+
+func (f *fakeRepository) CancelJob(_ context.Context, tenantID, id uuid.UUID) (*domain.Job, bool, error) {
+	f.cancelCalls++
+	f.gotCancelTan = tenantID
+	f.gotCancelID = id
+	return f.cancelJob, f.cancelReq, f.cancelErr
 }
 
 func (f *fakeRepository) ReplayJob(_ context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error) {

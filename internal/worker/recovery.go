@@ -36,11 +36,12 @@ func (r *Runner) recoverExpired(ctx context.Context) {
 		}
 		return
 	}
-	if result.Requeued > 0 || result.Dead > 0 {
+	if result.Requeued > 0 || result.Dead > 0 || result.Cancelled > 0 {
 		r.logger.Warn("recovered expired job leases",
 			"worker_id", r.workerID,
 			"requeued", result.Requeued,
 			"dead", result.Dead,
+			"cancelled", result.Cancelled,
 		)
 	}
 }

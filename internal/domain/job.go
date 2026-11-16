@@ -39,8 +39,9 @@ type Job struct {
 	LockedUntil *time.Time `json:"locked_until,omitempty"`
 	HeartbeatAt *time.Time `json:"heartbeat_at,omitempty"`
 
-	Result    json.RawMessage `json:"result,omitempty"`
-	LastError *string         `json:"last_error,omitempty"`
+	Result            json.RawMessage `json:"result,omitempty"`
+	LastError         *string         `json:"last_error,omitempty"`
+	CancelRequestedAt *time.Time      `json:"cancel_requested_at,omitempty"`
 
 	ReplayCount int        `json:"replay_count,omitempty"`
 	ReplayedBy  *string    `json:"replayed_by,omitempty"`

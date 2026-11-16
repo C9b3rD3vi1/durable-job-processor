@@ -24,6 +24,9 @@ const (
 	defaultRetryMaxDelay     = 15 * time.Minute
 	defaultRecoveryInterval  = 30 * time.Second
 	defaultMaxPayloadBytes   = 256 * 1024
+
+	defaultTenantMaxOutstandingJobs = 1000
+	defaultTenantRateLimitPerMinute = 600
 )
 
 // Config is the complete runtime configuration for the API and worker binaries.
@@ -51,6 +54,9 @@ type Config struct {
 	RecoveryInterval  time.Duration
 	MaxAttempts       int
 	MaxPayloadBytes   int64
+
+	TenantMaxOutstandingJobs int
+	TenantRateLimitPerMinute int
 }
 
 // Load reads configuration from environment variables and validates it.
@@ -116,6 +122,12 @@ func Load() (Config, error) {
 	if cfg.MaxAttempts, err = envInt("MAX_ATTEMPTS", domain.DefaultMaxAttempts); err != nil {
 		return Config{}, err
 	}
+	if cfg.TenantMaxOutstandingJobs, err = envInt("TENANT_MAX_OUTSTANDING_JOBS", defaultTenantMaxOutstandingJobs); err != nil {
+		return Config{}, err
+	}
+	if cfg.TenantRateLimitPerMinute, err = envInt("TENANT_RATE_LIMIT_PER_MINUTE", defaultTenantRateLimitPerMinute); err != nil {
+		return Config{}, err
+	}
 	cfg.MaxPayloadBytes, err = envInt64("MAX_PAYLOAD_BYTES", defaultMaxPayloadBytes)
 	if err != nil {
 		return Config{}, err
@@ -159,6 +171,12 @@ func Load() (Config, error) {
 	}
 	if cfg.MaxPayloadBytes < 1 {
 		return Config{}, fmt.Errorf("MAX_PAYLOAD_BYTES must be positive")
+	}
+	if cfg.TenantMaxOutstandingJobs < 0 {
+		return Config{}, fmt.Errorf("TENANT_MAX_OUTSTANDING_JOBS must not be negative")
+	}
+	if cfg.TenantRateLimitPerMinute < 0 {
+		return Config{}, fmt.Errorf("TENANT_RATE_LIMIT_PER_MINUTE must not be negative")
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive")

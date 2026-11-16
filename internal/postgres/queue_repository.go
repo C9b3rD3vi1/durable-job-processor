@@ -33,6 +33,7 @@ func (r *JobRepository) ClaimJob(ctx context.Context, workerID string, leaseDura
 			WHERE status IN ('queued', 'retry_wait')
 			  AND run_at <= now()
 			  AND attempts < max_attempts
+			  AND cancel_requested_at IS NULL
 			ORDER BY priority DESC, run_at ASC, created_at ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -89,7 +90,8 @@ func (r *JobRepository) CompleteJob(ctx context.Context, id, leaseToken uuid.UUI
 		    heartbeat_at = NULL
 		WHERE id = $1
 		  AND status = 'running'
-		  AND lease_token = $2`
+		  AND lease_token = $2
+		  AND cancel_requested_at IS NULL`
 
 	var resultParam any
 	if len(result) > 0 {
@@ -135,7 +137,8 @@ func (r *JobRepository) FailJob(ctx context.Context, id, leaseToken uuid.UUID, c
 		    heartbeat_at = NULL
 		WHERE id = $1
 		  AND status = 'running'
-		  AND lease_token = $2`
+		  AND lease_token = $2
+		  AND cancel_requested_at IS NULL`
 
 	var retrySeconds any
 	if retryDelay > 0 {
@@ -156,13 +159,15 @@ func (r *JobRepository) FailJob(ctx context.Context, id, leaseToken uuid.UUID, c
 
 // HeartbeatJob renews the lease only while the caller still holds it. A zero
 // rows-affected result is the fencing signal that the worker has lost
-// ownership and must stop state changes for this attempt.
-func (r *JobRepository) HeartbeatJob(ctx context.Context, id, leaseToken uuid.UUID, leaseDuration time.Duration) (bool, error) {
+// ownership and must stop state changes for this attempt. The renewal also
+// reports a durable cooperative cancellation request so the worker can stop the
+// handler without waiting for its lease to expire.
+func (r *JobRepository) HeartbeatJob(ctx context.Context, id, leaseToken uuid.UUID, leaseDuration time.Duration) (queue.HeartbeatResult, error) {
 	if id == uuid.Nil || leaseToken == uuid.Nil {
-		return false, fmt.Errorf("%w: job id and lease token are required", domain.ErrInvalidArgument)
+		return queue.HeartbeatResult{}, fmt.Errorf("%w: job id and lease token are required", domain.ErrInvalidArgument)
 	}
 	if leaseDuration <= 0 {
-		return false, fmt.Errorf("%w: lease duration must be positive", domain.ErrInvalidArgument)
+		return queue.HeartbeatResult{}, fmt.Errorf("%w: lease duration must be positive", domain.ErrInvalidArgument)
 	}
 
 	const query = `
@@ -172,15 +177,49 @@ func (r *JobRepository) HeartbeatJob(ctx context.Context, id, leaseToken uuid.UU
 		    updated_at   = now()
 		WHERE id = $2
 		  AND status = 'running'
-		  AND lease_token = $3`
+		  AND lease_token = $3
+		RETURNING cancel_requested_at IS NOT NULL`
 
-	tag, err := r.pool.Exec(ctx, query,
+	var cancelRequested bool
+	err := r.pool.QueryRow(ctx, query,
 		leaseDuration.Seconds(),
 		id.String(),
 		leaseToken.String(),
-	)
+	).Scan(&cancelRequested)
 	if err != nil {
-		return false, fmt.Errorf("heartbeat job: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return queue.HeartbeatResult{Renewed: false}, nil
+		}
+		return queue.HeartbeatResult{}, fmt.Errorf("heartbeat job: %w", err)
+	}
+	return queue.HeartbeatResult{Renewed: true, CancelRequested: cancelRequested}, nil
+}
+
+// CancelRunningJob finalizes a running job as cancelled. The update is fenced
+// by the lease token and requires a durable cancellation request, so a worker
+// that races with completion or loses its lease cannot cancel another attempt.
+func (r *JobRepository) CancelRunningJob(ctx context.Context, id, leaseToken uuid.UUID) (bool, error) {
+	if id == uuid.Nil || leaseToken == uuid.Nil {
+		return false, fmt.Errorf("%w: job id and lease token are required", domain.ErrInvalidArgument)
+	}
+
+	const query = `
+		UPDATE jobs
+		SET status       = 'cancelled',
+		    finished_at  = now(),
+		    updated_at   = now(),
+		    locked_by    = NULL,
+		    lease_token  = NULL,
+		    locked_until = NULL,
+		    heartbeat_at = NULL
+		WHERE id = $1
+		  AND status = 'running'
+		  AND lease_token = $2
+		  AND cancel_requested_at IS NOT NULL`
+
+	tag, err := r.pool.Exec(ctx, query, id.String(), leaseToken.String())
+	if err != nil {
+		return false, fmt.Errorf("cancel running job: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
@@ -188,7 +227,8 @@ func (r *JobRepository) HeartbeatJob(ctx context.Context, id, leaseToken uuid.UU
 // RecoverExpiredJobs resolves running jobs whose lease has expired. The scan
 // and update are one statement, so several workers can run recovery without
 // claiming the same abandoned row twice. Attempts are not incremented here;
-// the next claim does that. A job that already consumed its attempts is
+// the next claim does that. A job with a pending cancellation request is
+// finalized as cancelled, and a job that already consumed its attempts is
 // dead-lettered with a safe diagnostic message.
 func (r *JobRepository) RecoverExpiredJobs(ctx context.Context, limit int) (queue.RecoveryResult, error) {
 	if limit <= 0 {
@@ -208,18 +248,23 @@ func (r *JobRepository) RecoverExpiredJobs(ctx context.Context, limit int) (queu
 		updated AS (
 			UPDATE jobs AS j
 			SET status = CASE
+			        WHEN j.cancel_requested_at IS NOT NULL THEN 'cancelled'::job_status
 			        WHEN j.attempts >= j.max_attempts THEN 'dead'::job_status
 			        ELSE 'retry_wait'::job_status
 			    END,
 			    run_at = CASE
+			        WHEN j.cancel_requested_at IS NOT NULL THEN j.run_at
 			        WHEN j.attempts >= j.max_attempts THEN j.run_at
 			        ELSE now()
 			    END,
 			    finished_at = CASE
+			        WHEN j.cancel_requested_at IS NOT NULL THEN now()
 			        WHEN j.attempts >= j.max_attempts THEN now()
 			        ELSE NULL
 			    END,
 			    last_error = CASE
+			        WHEN j.cancel_requested_at IS NOT NULL
+			            THEN 'cancellation requested; lease expired before handler stopped'
 			        WHEN j.attempts >= j.max_attempts
 			            THEN 'lease expired after maximum attempts'
 			        ELSE 'lease expired; requeued for retry'
@@ -235,12 +280,17 @@ func (r *JobRepository) RecoverExpiredJobs(ctx context.Context, limit int) (queu
 		)
 		SELECT
 			count(*) FILTER (WHERE status = 'retry_wait'),
-			count(*) FILTER (WHERE status = 'dead')
+			count(*) FILTER (WHERE status = 'dead'),
+			count(*) FILTER (WHERE status = 'cancelled')
 		FROM updated`
 
-	var requeued, dead int64
-	if err := r.pool.QueryRow(ctx, query, limit).Scan(&requeued, &dead); err != nil {
+	var requeued, dead, cancelled int64
+	if err := r.pool.QueryRow(ctx, query, limit).Scan(&requeued, &dead, &cancelled); err != nil {
 		return queue.RecoveryResult{}, fmt.Errorf("recover expired jobs: %w", err)
 	}
-	return queue.RecoveryResult{Requeued: int(requeued), Dead: int(dead)}, nil
+	return queue.RecoveryResult{
+		Requeued:  int(requeued),
+		Dead:      int(dead),
+		Cancelled: int(cancelled),
+	}, nil
 }

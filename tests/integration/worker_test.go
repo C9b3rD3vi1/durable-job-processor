@@ -97,7 +97,7 @@ func createWorkerJob(
 		RunAt:       runAt,
 		Attempts:    attempts,
 		MaxAttempts: maxAttempts,
-	})
+	}, 0)
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}

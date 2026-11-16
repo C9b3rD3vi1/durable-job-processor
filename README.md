@@ -2,13 +2,14 @@
 
 A fault-tolerant background job processing system built with Go and PostgreSQL.
 
-**Phases 1–3 and API-key authentication are implemented:** durable submission and
-retrieval, a worker that executes typed handlers with bounded concurrency, the
-reliability layer (expiring leases, heartbeats, lease-token fencing, expired-job
-recovery, jittered retries, dead-lettering and audited manual replay), and
-hashed API keys that derive tenant and role from verified identity. Quotas,
-cancellation, job listing, observability and the delivery pipeline remain for
-later phases.
+**Phases 1–3 and Phase 6 tenant hardening are implemented:** durable submission
+and retrieval, a worker that executes typed handlers with bounded concurrency,
+the reliability layer (expiring leases, heartbeats, lease-token fencing,
+expired-job recovery, jittered retries, dead-lettering and audited manual
+replay), hashed API keys that derive tenant and role from verified identity,
+cursor-paginated job listing, cooperative cancellation, per-tenant outstanding
+quotas and in-memory per-tenant rate limits. Observability and the delivery
+pipeline remain for later phases.
 
 ## What works in Phases 2–3
 
@@ -53,7 +54,7 @@ later phases.
 - `GET /health/live` and `GET /health/ready`.
 - Structured request logging and panic recovery.
 
-## What works in Phase 6 (API authentication)
+## What works in Phase 6 (tenant hardening)
 
 - Bearer API keys stored only as SHA-256 digests in the `api_keys` table; the
   plaintext key is printed once at creation.
@@ -65,6 +66,19 @@ later phases.
 - `cmd/apikey` provisions, lists and revokes keys without exposing digests.
 - Missing, malformed, unknown and revoked keys return `401`; a valid key without
   the operator role receives `403` on replay.
+- `GET /v1/jobs` lists only the authenticated tenant's jobs with opaque keyset
+  pagination ordered by `(created_at DESC, id DESC)` and filters for `status`,
+  `job_type`, `created_after` and `created_before`.
+- `POST /v1/jobs/{id}/cancel` cancels queued and retry-wait jobs immediately. A
+  running job receives a durable cancellation request that its worker observes
+  on the next heartbeat, cancels the handler context and fences the attempt as
+  `cancelled`. Terminal jobs return `409`.
+- A per-tenant outstanding-job quota counts `queued`, `running` and `retry_wait`
+  rows. Submission is serialized per tenant in PostgreSQL, so concurrent
+  requests cannot overshoot the quota; an idempotent replay is not a new job and
+  does not consume quota.
+- A per-tenant fixed-window request rate limit runs after authentication and
+  returns `429` with `Retry-After` when a tenant exceeds its budget.
 
 Job payloads are deliberately omitted from API responses to avoid exposing
 sensitive data. Lease fields and idempotency keys are internal.
@@ -146,8 +160,9 @@ go run ./cmd/apikey revoke -tenant "$TENANT_ID" -name reporting-client
 ```
 
 Key names are unique within a tenant. If a key is lost, revoke it and create a
-replacement; there is no recovery path by design. Rate limits and per-tenant
-quotas are tracked as remaining Phase 6 work.
+replacement; there is no recovery path by design. Rate limits are applied per
+tenant by the API instance, while outstanding-job quotas are enforced durably in
+PostgreSQL and shared by every API replica.
 
 ## API examples
 
@@ -191,6 +206,41 @@ curl http://localhost:8080/v1/jobs/<job-id> \
   -H "Authorization: Bearer $API_KEY"
 ```
 
+List the tenant's jobs newest first. `limit` defaults to 50 and is capped at 100;
+`next_cursor` is opaque and is passed back unchanged:
+
+```bash
+curl "http://localhost:8080/v1/jobs?status=dead&job_type=report.generate&limit=25" \
+  -H "Authorization: Bearer $API_KEY"
+
+# Follow the cursor returned by the previous page.
+curl "http://localhost:8080/v1/jobs?limit=25&cursor=$NEXT_CURSOR" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Filters are optional: `status`, `job_type`, `created_after` and `created_before`
+(RFC 3339 timestamps). The response is `{"jobs": [...], "next_cursor": "..."}`;
+`next_cursor` is absent on the final page.
+
+Cancel a job:
+
+```bash
+curl -i -X POST http://localhost:8080/v1/jobs/<job-id>/cancel \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+A queued or retry-wait job becomes `cancelled` immediately and the response is
+`200`. A running job receives a durable cancellation request: the response is
+`202 Accepted` with `Cancel-Requested: true`, the handler's context is cancelled
+on the worker's next heartbeat, and the attempt is fenced to `cancelled`. A job
+that already reached `succeeded`, `dead` or `cancelled` is not cancellable and
+returns `409`. Cancelling an already cancelled job is idempotent.
+
+When a tenant is at `TENANT_MAX_OUTSTANDING_JOBS`, submission returns `429` with
+error code `quota_exceeded`. Completing, cancelling or dead-lettering a job frees
+quota. When the request budget is exhausted, the API returns `429` with error
+code `rate_limited` and a `Retry-After` header.
+
 Supported job types and their built-in handlers:
 
 | Job type | Handler behaviour |
@@ -233,6 +283,11 @@ the handler context is cancelled and its result is discarded. Success and failur
 writes use the same lease-token condition, which fences a stale worker after one
 expired lease has been recovered.
 
+The heartbeat also reports a durable `cancel_requested_at` set by
+`POST /v1/jobs/{id}/cancel`. The worker cancels the handler context immediately
+and, after the handler returns, fences the attempt to `cancelled` with the lease
+token instead of recording success or failure.
+
 A failed handler is classified:
 
 - transient, cancelled and unknown failures retry with
@@ -242,9 +297,10 @@ A failed handler is classified:
 
 A separate recovery loop runs every `RECOVERY_INTERVAL` inside each worker. It
 finds `running` rows with `locked_until < now()`, takes them with
-`FOR UPDATE SKIP LOCKED`, and returns them to `retry_wait` or `dead` according to
-their attempt count. The scan and update are one statement, so several workers
-can run recovery concurrently without stealing the same row.
+`FOR UPDATE SKIP LOCKED`, and returns them to `retry_wait`, dead-letters them
+according to their attempt count, or finalizes a pending cancellation as
+`cancelled`. The scan and update are one statement, so several workers can run
+recovery concurrently without stealing the same row.
 
 Observe a job after submitting it:
 
@@ -302,6 +358,8 @@ records a retry for work that could not finish.
 | `RECOVERY_INTERVAL` | `30s` | Background expired-lease scan cadence |
 | `MAX_ATTEMPTS` | `5` | Default maximum attempts per job |
 | `MAX_PAYLOAD_BYTES` | `262144` | Maximum JSON payload size |
+| `TENANT_MAX_OUTSTANDING_JOBS` | `1000` | Queued, running and retry-wait jobs per tenant; `0` disables |
+| `TENANT_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant API requests per fixed minute; `0` disables |
 
 `LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`. `HANDLER_TIMEOUT` may
 exceed the lease because heartbeats keep the lease alive for the whole handler.
@@ -323,7 +381,8 @@ indexes. `migrations/0002_add_replay_audit.sql` adds the durable
 `replay_count`, `replayed_by` and `replayed_at` audit columns.
 `migrations/0003_add_api_keys.sql` adds the `api_keys` table with role checks,
 per-tenant unique names, unique 32-byte SHA-256 digests and revocation
-timestamps.
+timestamps. `migrations/0004_add_cancellation.sql` adds `cancel_requested_at`
+and the `(tenant_id, created_at DESC, id DESC)` index used by cursor pagination.
 
 ## Tests
 
@@ -361,7 +420,15 @@ The integration suite verifies:
   jittered retry;
 - replay moves a dead job back to `retry_wait`, resets attempts, records the
   audit columns and rejects non-dead or cross-tenant jobs;
-- only operator keys can replay, and `replayed_by` records the operator key name.
+- only operator keys can replay, and `replayed_by` records the operator key name;
+- listing paginates with an opaque cursor, applies status/type/time filters and
+  never leaks another tenant's jobs;
+- queued cancellation is immediate, running cancellation is cooperative and
+  lease-fenced, and terminal jobs return `409`;
+- recovery finalizes a pending cancellation after a lease expires;
+- outstanding quotas reject excess submissions atomically and idempotent
+  replays bypass the quota;
+- the API maps quota exhaustion to `429 quota_exceeded`.
 
 Phase 2–3 claim and concurrency tests run in throwaway PostgreSQL schemas, so
 they do not depend on or disturb development data. Integration tests are skipped
@@ -398,7 +465,7 @@ docs/architecture/       Architecture blueprint and diagrams
 | 3 — Concurrency and bounded pool | Implemented with Phase 2 |
 | 4 — Leases, heartbeat and recovery | Implemented with Phase 3 |
 | 5 — Retry, dead-letter and replay | Implemented with Phase 3 |
-| 6 — Authentication and tenant hardening | API-key authentication implemented; quotas, cancellation and listing pending |
+| 6 — Authentication and tenant hardening | Implemented: API keys, listing, cancellation, quotas and rate limits |
 | 7 — Observability | Planned |
 | 8 — Containers and CI | Planned |
 | 9 — AWS and Terraform | Planned |

@@ -43,8 +43,12 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 	if !ok {
 		// A job can outlive a handler that was removed from the binary. Retrying
 		// will not help, so dead-letter it immediately.
-		r.fail(ctx, job, logger,
-			retry.Permanent(fmt.Errorf("no handler registered for job type %q", job.JobType)), 0)
+		if !r.fail(ctx, job, logger,
+			retry.Permanent(fmt.Errorf("no handler registered for job type %q", job.JobType)), 0) {
+			if !r.cancelledAfterWrite(ctx, job, logger) {
+				logger.Warn("job failure fenced; lease is no longer held")
+			}
+		}
 		return
 	}
 
@@ -55,13 +59,21 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 	defer stopHeartbeat()
 
 	var leaseLost atomic.Bool
+	var cancellationRequested atomic.Bool
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		r.heartbeat(heartbeatCtx, job, func() {
-			leaseLost.Store(true)
-			cancelHandler()
-		})
+		r.heartbeat(heartbeatCtx, job,
+			func() {
+				leaseLost.Store(true)
+				cancelHandler()
+			},
+			func() {
+				if cancellationRequested.CompareAndSwap(false, true) {
+					cancelHandler()
+				}
+			},
+		)
 	}()
 
 	started := time.Now()
@@ -81,6 +93,15 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 		return
 	}
 
+	// A durable cancellation request is authoritative. Persist the cancelled
+	// state with the same lease fence and discard whatever the handler returned.
+	if cancellationRequested.Load() {
+		if !r.cancelledAfterWrite(ctx, job, logger) {
+			logger.Warn("job cancellation fenced; lease is no longer held")
+		}
+		return
+	}
+
 	if err == nil && timedOut {
 		err = fmt.Errorf("handler timed out after %s", r.handlerTimeout)
 	}
@@ -92,7 +113,11 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 		if retry.ShouldRetry(retry.Classify(err), job.Attempts, job.MaxAttempts) {
 			retryDelay = r.retryDelay(job.Attempts)
 		}
-		r.fail(ctx, job, logger, err, retryDelay)
+		if !r.fail(ctx, job, logger, err, retryDelay) {
+			if !r.cancelledAfterWrite(ctx, job, logger) {
+				logger.Warn("job failure fenced; lease is no longer held")
+			}
+		}
 		return
 	}
 
@@ -105,7 +130,11 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 		return
 	}
 	if !completed {
-		logger.Warn("job completion fenced; lease is no longer held")
+		// Completion is rejected when the lease was lost or a cancellation
+		// request landed first. Try to finalize the cancellation durably.
+		if !r.cancelledAfterWrite(ctx, job, logger) {
+			logger.Warn("job completion fenced; lease is no longer held")
+		}
 		return
 	}
 	logger.Info("job succeeded", "duration", elapsed.String())
@@ -114,7 +143,9 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 // heartbeat renews the lease until the handler finishes or ownership is lost.
 // A database error is retried on the next tick; a fenced update means another
 // worker owns the job, so the handler is cancelled and its result is discarded.
-func (r *Runner) heartbeat(ctx context.Context, job *domain.Job, onLost func()) {
+// A durable cancellation request also cancels the handler but keeps renewing the
+// lease so this worker can finalize the attempt as cancelled.
+func (r *Runner) heartbeat(ctx context.Context, job *domain.Job, onLost, onCancel func()) {
 	ticker := time.NewTicker(r.heartbeatInterval)
 	defer ticker.Stop()
 
@@ -124,7 +155,7 @@ func (r *Runner) heartbeat(ctx context.Context, job *domain.Job, onLost func()) 
 			return
 		case <-ticker.C:
 			heartbeatCtx, cancel := context.WithTimeout(ctx, persistTimeout)
-			renewed, err := r.store.HeartbeatJob(heartbeatCtx, job.ID, *job.LeaseToken, r.leaseDuration)
+			result, err := r.store.HeartbeatJob(heartbeatCtx, job.ID, *job.LeaseToken, r.leaseDuration)
 			cancel()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -137,17 +168,42 @@ func (r *Runner) heartbeat(ctx context.Context, job *domain.Job, onLost func()) 
 				)
 				continue
 			}
-			if !renewed {
+			if !result.Renewed {
 				onLost()
 				return
+			}
+			if result.CancelRequested {
+				onCancel()
 			}
 		}
 	}
 }
 
+// cancelledAfterWrite finalizes a cooperative cancellation after a heartbeat
+// observed the request, or after a completion/failure write was rejected because
+// a cancellation request landed first. It returns true when the job was
+// durably marked cancelled.
+func (r *Runner) cancelledAfterWrite(ctx context.Context, job *domain.Job, logger *slog.Logger) bool {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	defer cancel()
+
+	cancelled, err := r.store.CancelRunningJob(persistCtx, job.ID, *job.LeaseToken)
+	if err != nil {
+		logger.Error("cancel running job", "error", err)
+		return false
+	}
+	if !cancelled {
+		return false
+	}
+	logger.Info("job cancelled")
+	return true
+}
+
 // fail records a handler failure. A positive retryDelay schedules a retry until
-// attempts are exhausted; a zero delay dead-letters the job immediately.
-func (r *Runner) fail(ctx context.Context, job *domain.Job, logger *slog.Logger, cause error, retryDelay time.Duration) {
+// attempts are exhausted; a zero delay dead-letters the job immediately. It
+// returns false when the lease is no longer current or cancellation won the
+// race, so the caller can try to finalize a cancellation instead.
+func (r *Runner) fail(ctx context.Context, job *domain.Job, logger *slog.Logger, cause error, retryDelay time.Duration) bool {
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
 	defer cancel()
 
@@ -155,21 +211,21 @@ func (r *Runner) fail(ctx context.Context, job *domain.Job, logger *slog.Logger,
 	failed, err := r.store.FailJob(persistCtx, job.ID, *job.LeaseToken, message, retryDelay)
 	if err != nil {
 		logger.Error("fail job", "error", err)
-		return
+		return false
 	}
 	if !failed {
-		logger.Warn("job failure fenced; lease is no longer held")
-		return
+		return false
 	}
 
 	if retryDelay <= 0 || job.Attempts >= job.MaxAttempts {
 		logger.Error("job dead-lettered", "error", message)
-		return
+		return true
 	}
 	logger.Warn("job failed; retry scheduled",
 		"error", message,
 		"retry_in", retryDelay.String(),
 	)
+	return true
 }
 
 // invokeHandler isolates the runner from handler panics.

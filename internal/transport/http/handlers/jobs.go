@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/jobs"
@@ -20,6 +23,8 @@ import (
 type JobService interface {
 	Submit(ctx context.Context, in jobs.SubmitInput) (*domain.Job, bool, error)
 	Get(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, error)
+	List(ctx context.Context, tenantID uuid.UUID, in jobs.ListInput) (*jobs.ListResult, error)
+	Cancel(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, bool, error)
 	Replay(ctx context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error)
 }
 
@@ -115,6 +120,103 @@ func (h *JobsHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, dto.NewJobResponse(job))
 }
 
+// ListJobs handles GET /v1/jobs with cursor pagination and optional filters.
+func (h *JobsHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
+	identity, ok := middleware.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication_required", "authentication is required")
+		return
+	}
+
+	query := r.URL.Query()
+	in := jobs.ListInput{
+		JobType: strings.TrimSpace(query.Get("job_type")),
+		Cursor:  strings.TrimSpace(query.Get("cursor")),
+	}
+
+	if raw := strings.TrimSpace(query.Get("status")); raw != "" {
+		status := domain.JobStatus(raw)
+		in.Status = &status
+	}
+
+	var err error
+	if in.CreatedAfter, err = parseTimeQuery(query.Get("created_after"), "created_after"); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	if in.CreatedBefore, err = parseTimeQuery(query.Get("created_before"), "created_before"); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
+		return
+	}
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+		limit, convErr := strconv.Atoi(raw)
+		if convErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_query", "limit must be an integer")
+			return
+		}
+		in.Limit = limit
+	}
+
+	result, err := h.service.List(r.Context(), identity.TenantID, in)
+	if err != nil {
+		h.handleServiceError(w, r, identity.TenantID, uuid.Nil, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto.NewListJobsResponse(result.Jobs, result.NextCursor))
+}
+
+// CancelJob handles POST /v1/jobs/{id}/cancel. Queued and retry_wait jobs are
+// cancelled immediately; a running job receives a durable cooperative
+// cancellation request and is finalized by its worker.
+func (h *JobsHandler) CancelJob(w http.ResponseWriter, r *http.Request) {
+	identity, ok := middleware.IdentityFrom(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication_required", "authentication is required")
+		return
+	}
+
+	id, err := uuid.Parse(strings.TrimSpace(r.PathValue("id")))
+	if err != nil || id == uuid.Nil {
+		writeError(w, http.StatusBadRequest, "invalid_job_id", "job id must be a valid UUID")
+		return
+	}
+
+	job, cooperative, err := h.service.Cancel(r.Context(), identity.TenantID, id)
+	if err != nil {
+		h.handleServiceError(w, r, identity.TenantID, id, err)
+		return
+	}
+
+	h.logger.Info("job cancellation requested",
+		"event", "job.cancelled",
+		"tenant_id", identity.TenantID,
+		"job_id", job.ID,
+		"status", job.Status,
+		"cooperative", cooperative,
+		"api_key_id", identity.KeyID,
+	)
+
+	if cooperative {
+		w.Header().Set("Cancel-Requested", "true")
+		writeJSON(w, http.StatusAccepted, dto.NewJobResponse(job))
+		return
+	}
+	writeJSON(w, http.StatusOK, dto.NewJobResponse(job))
+}
+
+func parseTimeQuery(raw, name string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	value, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be an RFC3339 timestamp", name)
+	}
+	value = value.UTC()
+	return &value, nil
+}
+
 // ReplayJob handles POST /v1/jobs/{id}/replay. Only operators may replay, and
 // only dead jobs owned by the operator's tenant are eligible.
 func (h *JobsHandler) ReplayJob(w http.ResponseWriter, r *http.Request) {
@@ -169,12 +271,16 @@ func (h *JobsHandler) decodeJSON(w http.ResponseWriter, r *http.Request, dst any
 
 func (h *JobsHandler) handleServiceError(w http.ResponseWriter, r *http.Request, tenantID, jobID uuid.UUID, err error) {
 	switch {
-	case errors.Is(err, domain.ErrInvalidJob), errors.Is(err, domain.ErrInvalidArgument):
+	case errors.Is(err, domain.ErrInvalidJob):
 		writeError(w, http.StatusBadRequest, "invalid_job", err.Error())
+	case errors.Is(err, domain.ErrInvalidArgument):
+		writeError(w, http.StatusBadRequest, "invalid_argument", err.Error())
 	case errors.Is(err, domain.ErrNotFound):
 		writeError(w, http.StatusNotFound, "job_not_found", "job not found")
+	case errors.Is(err, domain.ErrQuotaExceeded):
+		writeError(w, http.StatusTooManyRequests, "quota_exceeded", err.Error())
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeError(w, http.StatusConflict, "invalid_transition", "only dead jobs can be replayed")
+		writeError(w, http.StatusConflict, "invalid_transition", "job state does not allow this operation")
 	case errors.Is(err, context.Canceled):
 		writeError(w, http.StatusRequestTimeout, "request_canceled", "request was canceled")
 	default:

@@ -64,15 +64,17 @@ func run() error {
 
 	repository := postgres.NewJobRepository(pool)
 	validator := jobs.NewValidator(handlers.DefaultRegistry(), cfg.MaxPayloadBytes, cfg.MaxAttempts)
-	service := jobs.NewService(repository, validator)
+	service := jobs.NewService(repository, validator,
+		jobs.WithMaxOutstandingJobs(cfg.TenantMaxOutstandingJobs))
 	authenticator := auth.NewAuthenticator(postgres.NewAPIKeyRepository(pool))
 
 	router := httpapi.NewRouter(httpapi.Options{
-		JobService:    service,
-		Pinger:        pool,
-		Authenticator: authenticator,
-		Logger:        logger,
-		MaxBodyBytes:  cfg.RequestBodyLimit(),
+		JobService:         service,
+		Pinger:             pool,
+		Authenticator:      authenticator,
+		Logger:             logger,
+		MaxBodyBytes:       cfg.RequestBodyLimit(),
+		RateLimitPerMinute: cfg.TenantRateLimitPerMinute,
 	})
 
 	server := &http.Server{

@@ -12,18 +12,36 @@ import (
 
 // Service owns submission and retrieval rules.
 type Service struct {
-	repo      Repository
-	validator *Validator
-	now       func() time.Time
+	repo               Repository
+	validator          *Validator
+	now                func() time.Time
+	maxOutstandingJobs int
+}
+
+// Option configures a Service.
+type Option func(*Service)
+
+// WithMaxOutstandingJobs caps the number of queued, running and retry_wait
+// jobs per tenant. A non-positive value disables the quota.
+func WithMaxOutstandingJobs(limit int) Option {
+	return func(s *Service) {
+		s.maxOutstandingJobs = limit
+	}
 }
 
 // NewService wires a repository and validator together.
-func NewService(repo Repository, validator *Validator) *Service {
-	return &Service{
+func NewService(repo Repository, validator *Validator, opts ...Option) *Service {
+	service := &Service{
 		repo:      repo,
 		validator: validator,
 		now:       time.Now,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(service)
+		}
+	}
+	return service
 }
 
 // Submit validates and persists a job. The boolean reports whether a new row
@@ -40,7 +58,7 @@ func (s *Service) Submit(ctx context.Context, in SubmitInput) (*domain.Job, bool
 	if err != nil {
 		return nil, false, err
 	}
-	return s.repo.CreateJob(ctx, job)
+	return s.repo.CreateJob(ctx, job, s.maxOutstandingJobs)
 }
 
 // Get returns a tenant-scoped job.

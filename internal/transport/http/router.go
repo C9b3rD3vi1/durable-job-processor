@@ -21,11 +21,12 @@ type Pinger interface {
 
 // Options contains the router dependencies.
 type Options struct {
-	JobService    handlers.JobService
-	Pinger        Pinger
-	Authenticator auth.TokenAuthenticator
-	Logger        *slog.Logger
-	MaxBodyBytes  int64
+	JobService         handlers.JobService
+	Pinger             Pinger
+	Authenticator      auth.TokenAuthenticator
+	Logger             *slog.Logger
+	MaxBodyBytes       int64
+	RateLimitPerMinute int
 }
 
 // NewRouter builds the HTTP handler tree.
@@ -37,11 +38,19 @@ func NewRouter(opts Options) http.Handler {
 
 	jobsHandler := handlers.NewJobsHandler(opts.JobService, logger, opts.MaxBodyBytes)
 	authenticated := middleware.RequireAuth(opts.Authenticator, logger)
+	rateLimited := middleware.RateLimit(middleware.NewRateLimiter(opts.RateLimitPerMinute, time.Minute), logger)
+	// Authentication runs before the per-tenant rate limiter so the tenant is
+	// always a verified identity and unknown keys never consume a budget.
+	authorized := func(next http.Handler) http.Handler {
+		return authenticated(rateLimited(next))
+	}
 	mux := http.NewServeMux()
 
-	mux.Handle("POST /v1/jobs", authenticated(http.HandlerFunc(jobsHandler.CreateJob)))
-	mux.Handle("GET /v1/jobs/{id}", authenticated(http.HandlerFunc(jobsHandler.GetJob)))
-	mux.Handle("POST /v1/jobs/{id}/replay", authenticated(
+	mux.Handle("POST /v1/jobs", authorized(http.HandlerFunc(jobsHandler.CreateJob)))
+	mux.Handle("GET /v1/jobs", authorized(http.HandlerFunc(jobsHandler.ListJobs)))
+	mux.Handle("GET /v1/jobs/{id}", authorized(http.HandlerFunc(jobsHandler.GetJob)))
+	mux.Handle("POST /v1/jobs/{id}/cancel", authorized(http.HandlerFunc(jobsHandler.CancelJob)))
+	mux.Handle("POST /v1/jobs/{id}/replay", authorized(
 		middleware.RequireRole(auth.RoleOperator)(http.HandlerFunc(jobsHandler.ReplayJob)),
 	))
 

@@ -14,4 +14,8 @@ var (
 
 	// ErrInvalidTransition indicates an illegal job lifecycle transition.
 	ErrInvalidTransition = errors.New("invalid job status transition")
+
+	// ErrQuotaExceeded indicates that a tenant has reached its outstanding-job
+	// quota. Cancelling or completing jobs frees quota.
+	ErrQuotaExceeded = errors.New("tenant job quota exceeded")
 )

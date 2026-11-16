@@ -39,6 +39,7 @@ func TestCanTransition(t *testing.T) {
 		{StatusRunning, StatusSucceeded, true},
 		{StatusRunning, StatusRetryWait, true},
 		{StatusRunning, StatusDead, true},
+		{StatusRunning, StatusCancelled, true},
 		{StatusDead, StatusRetryWait, true},
 		{StatusSucceeded, StatusRunning, false},
 		{StatusCancelled, StatusQueued, false},

@@ -38,9 +38,15 @@ type fakeStore struct {
 	completeErr error
 	failErr     error
 
-	heartbeatCalls int
-	heartbeatOK    bool
-	heartbeatErr   error
+	heartbeatCalls  int
+	heartbeatOK     bool
+	heartbeatCancel bool
+	heartbeatErr    error
+
+	cancelOK      bool
+	cancelCalls   int
+	cancelErr     error
+	cancelledJobs map[uuid.UUID]bool
 
 	recoveryCalls  int
 	recoveryResult queue.RecoveryResult
@@ -49,12 +55,14 @@ type fakeStore struct {
 
 func newFakeStore(jobs ...*domain.Job) *fakeStore {
 	return &fakeStore{
-		jobs:        jobs,
-		completed:   make(map[uuid.UUID]json.RawMessage),
-		failed:      make(map[uuid.UUID]failureRecord),
-		completeOK:  true,
-		failOK:      true,
-		heartbeatOK: true,
+		jobs:          jobs,
+		completed:     make(map[uuid.UUID]json.RawMessage),
+		failed:        make(map[uuid.UUID]failureRecord),
+		cancelledJobs: make(map[uuid.UUID]bool),
+		completeOK:    true,
+		failOK:        true,
+		heartbeatOK:   true,
+		cancelOK:      true,
 	}
 }
 
@@ -108,17 +116,32 @@ func (s *fakeStore) FailJob(_ context.Context, id, _ uuid.UUID, cause string, de
 	return true, nil
 }
 
-func (s *fakeStore) HeartbeatJob(_ context.Context, _, _ uuid.UUID, _ time.Duration) (bool, error) {
+func (s *fakeStore) HeartbeatJob(_ context.Context, _, _ uuid.UUID, _ time.Duration) (queue.HeartbeatResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.heartbeatErr != nil {
-		return false, s.heartbeatErr
+		return queue.HeartbeatResult{}, s.heartbeatErr
 	}
 	s.heartbeatCalls++
 	if !s.heartbeatOK {
+		return queue.HeartbeatResult{Renewed: false}, nil
+	}
+	return queue.HeartbeatResult{Renewed: true, CancelRequested: s.heartbeatCancel}, nil
+}
+
+func (s *fakeStore) CancelRunningJob(_ context.Context, id, _ uuid.UUID) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cancelCalls++
+	if s.cancelErr != nil {
+		return false, s.cancelErr
+	}
+	if !s.cancelOK {
 		return false, nil
 	}
+	s.cancelledJobs[id] = true
 	return true, nil
 }
 
@@ -170,6 +193,18 @@ func (s *fakeStore) failedCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.failed)
+}
+
+func (s *fakeStore) cancelledCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.cancelledJobs)
+}
+
+func (s *fakeStore) cancelCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelCalls
 }
 
 func (s *fakeStore) claimCount() int {
@@ -428,6 +463,94 @@ func TestProcessStopsWhenLeaseIsLost(t *testing.T) {
 	}
 	if store.completedCount() != 0 || store.failedCount() != 0 {
 		t.Error("a worker that lost its lease wrote job state")
+	}
+}
+
+func TestProcessHonorsCancellationRequest(t *testing.T) {
+	store := newFakeStore()
+	store.heartbeatCancel = true
+
+	started := make(chan struct{})
+	registry := registryWith(t, "test.cancel", handlers.HandlerFunc(func(ctx context.Context, _ domain.Job) (json.RawMessage, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.LeaseDuration = time.Second
+		cfg.HeartbeatInterval = 5 * time.Millisecond
+		cfg.HandlerTimeout = 2 * time.Second
+	})
+
+	done := make(chan struct{})
+	go func() {
+		runner.process(context.Background(), testJob("test.cancel", 1, 3))
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("process did not stop after cancellation was requested")
+	}
+
+	if store.cancelledCount() != 1 {
+		t.Errorf("cancelled %d jobs, want 1", store.cancelledCount())
+	}
+	if store.completedCount() != 0 || store.failedCount() != 0 {
+		t.Error("a cancelled job was recorded as completed or failed")
+	}
+}
+
+func TestProcessFinalizesCancellationWhenCompletionIsRejected(t *testing.T) {
+	store := newFakeStore()
+	store.completeOK = false
+
+	registry := registryWith(t, "test.cancel", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		return json.RawMessage(`{"ok":true}`), nil
+	}))
+	runner := newRunner(t, store, registry, nil)
+
+	runner.process(context.Background(), testJob("test.cancel", 1, 3))
+
+	if store.cancelledCount() != 1 {
+		t.Errorf("cancelled %d jobs, want 1", store.cancelledCount())
+	}
+	if store.completedCount() != 0 {
+		t.Error("rejected completion was recorded")
+	}
+	if store.cancelCount() == 0 {
+		t.Error("cancellation finalization was never attempted")
+	}
+}
+
+func TestProcessCancellationWriteIsFenced(t *testing.T) {
+	store := newFakeStore()
+	store.cancelOK = false
+	store.heartbeatCancel = true
+
+	registry := registryWith(t, "test.cancel", handlers.HandlerFunc(func(ctx context.Context, _ domain.Job) (json.RawMessage, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.LeaseDuration = time.Second
+		cfg.HeartbeatInterval = 5 * time.Millisecond
+		cfg.HandlerTimeout = 2 * time.Second
+	})
+
+	runner.process(context.Background(), testJob("test.cancel", 1, 3))
+
+	if store.cancelledCount() != 0 {
+		t.Error("fenced cancellation was recorded")
+	}
+	if store.completedCount() != 0 || store.failedCount() != 0 {
+		t.Error("a cancelled job was recorded as completed or failed")
 	}
 }
 

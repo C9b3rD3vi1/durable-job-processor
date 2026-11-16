@@ -38,6 +38,14 @@ type fakeService struct {
 	replayJob     *domain.Job
 	replayErr     error
 	gotReplayedBy string
+
+	listResult *jobs.ListResult
+	listErr    error
+	gotList    jobs.ListInput
+
+	cancelJob     *domain.Job
+	cancelRequest bool
+	cancelErr     error
 }
 
 func (f *fakeService) Submit(_ context.Context, in jobs.SubmitInput) (*domain.Job, bool, error) {
@@ -56,6 +64,18 @@ func (f *fakeService) Replay(_ context.Context, tenantID, id uuid.UUID, replayed
 	f.gotID = id
 	f.gotReplayedBy = replayedBy
 	return f.replayJob, f.replayErr
+}
+
+func (f *fakeService) List(_ context.Context, tenantID uuid.UUID, in jobs.ListInput) (*jobs.ListResult, error) {
+	f.gotTenant = tenantID
+	f.gotList = in
+	return f.listResult, f.listErr
+}
+
+func (f *fakeService) Cancel(_ context.Context, tenantID, id uuid.UUID) (*domain.Job, bool, error) {
+	f.gotTenant = tenantID
+	f.gotID = id
+	return f.cancelJob, f.cancelRequest, f.cancelErr
 }
 
 type fakePinger struct{ err error }
@@ -238,6 +258,203 @@ func TestGetJobNotFound(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestListJobs(t *testing.T) {
+	tenantID := uuid.New()
+	first := sampleJob(tenantID)
+	second := sampleJob(tenantID)
+	service := &fakeService{listResult: &jobs.ListResult{
+		Jobs:       []*domain.Job{first, second},
+		NextCursor: "next-page",
+	}}
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v1/jobs?status=queued&job_type=report.generate&limit=2&created_after=2026-11-01T00:00:00Z&cursor=abc",
+		nil,
+	)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if service.gotTenant != tenantID {
+		t.Errorf("tenant = %v, want %v", service.gotTenant, tenantID)
+	}
+	if service.gotList.Status == nil || *service.gotList.Status != domain.StatusQueued {
+		t.Errorf("status filter = %v, want queued", service.gotList.Status)
+	}
+	if service.gotList.JobType != "report.generate" {
+		t.Errorf("job_type filter = %q, want report.generate", service.gotList.JobType)
+	}
+	if service.gotList.Limit != 2 {
+		t.Errorf("limit = %d, want 2", service.gotList.Limit)
+	}
+	if service.gotList.CreatedAfter == nil {
+		t.Error("created_after was not parsed")
+	}
+	if service.gotList.Cursor != "abc" {
+		t.Errorf("cursor = %q, want abc", service.gotList.Cursor)
+	}
+
+	var response dto.ListJobsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Jobs) != 2 || response.NextCursor != "next-page" {
+		t.Errorf("response = %+v, want 2 jobs and next-page cursor", response)
+	}
+}
+
+func TestListJobsRejectsInvalidQuery(t *testing.T) {
+	tenantID := uuid.New()
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	for _, query := range []string{
+		"limit=not-a-number",
+		"created_after=yesterday",
+		"created_before=2026-11-16",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/jobs?"+query, nil)
+		authenticate(req, clientToken)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("query %q status = %d, want 400", query, rec.Code)
+		}
+		var response dto.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode error response: %v", err)
+		}
+		if response.Error.Code != "invalid_query" {
+			t.Errorf("query %q error code = %q, want invalid_query", query, response.Error.Code)
+		}
+	}
+}
+
+func TestCancelQueuedJob(t *testing.T) {
+	tenantID := uuid.New()
+	job := sampleJob(tenantID)
+	job.Status = domain.StatusCancelled
+	service := &fakeService{cancelJob: job}
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/cancel", nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if service.gotTenant != tenantID || service.gotID != job.ID {
+		t.Errorf("service got %v/%v, want %v/%v", service.gotTenant, service.gotID, tenantID, job.ID)
+	}
+}
+
+func TestCancelRunningJobIsCooperative(t *testing.T) {
+	tenantID := uuid.New()
+	job := sampleJob(tenantID)
+	job.Status = domain.StatusRunning
+	service := &fakeService{cancelJob: job, cancelRequest: true}
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+job.ID.String()+"/cancel", nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cancel-Requested"); got != "true" {
+		t.Errorf("Cancel-Requested = %q, want true", got)
+	}
+}
+
+func TestCancelTerminalJobConflicts(t *testing.T) {
+	tenantID := uuid.New()
+	service := &fakeService{cancelErr: domain.ErrInvalidTransition}
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+uuid.New().String()+"/cancel", nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
+func TestSubmitQuotaExceeded(t *testing.T) {
+	tenantID := uuid.New()
+	service := &fakeService{submitErr: domain.ErrQuotaExceeded}
+	router := testRouter(service, fakePinger{}, 1<<20, testAuthenticator(tenantID))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(
+		`{"job_type":"report.generate","payload":{"report_id":"r-1"}}`,
+	))
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", rec.Code, rec.Body.String())
+	}
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "quota_exceeded" {
+		t.Errorf("error code = %q, want quota_exceeded", response.Error.Code)
+	}
+}
+
+func TestRateLimitIsPerTenant(t *testing.T) {
+	tenantID := uuid.New()
+	service := &fakeService{listResult: &jobs.ListResult{}}
+	router := NewRouter(Options{
+		JobService:         service,
+		Pinger:             fakePinger{},
+		Authenticator:      testAuthenticator(tenantID),
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBodyBytes:       1 << 20,
+		RateLimitPerMinute: 2,
+	})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+		authenticate(req, clientToken)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", i, rec.Code)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-limit status = %d, want 429; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After header is empty")
+	}
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "rate_limited" {
+		t.Errorf("error code = %q, want rate_limited", response.Error.Code)
 	}
 }
 

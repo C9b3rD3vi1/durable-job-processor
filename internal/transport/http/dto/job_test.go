@@ -14,24 +14,26 @@ func TestNewJobResponse(t *testing.T) {
 	location := time.FixedZone("UTC+3", 3*60*60)
 	started := time.Date(2026, 11, 15, 12, 0, 0, 0, location)
 	finished := started.Add(time.Minute)
+	cancelRequested := started.Add(30 * time.Second)
 
 	job := &domain.Job{
-		ID:             uuid.New(),
-		TenantID:       uuid.New(),
-		JobType:        "report.generate",
-		Payload:        json.RawMessage(`{"secret":"value"}`),
-		Status:         domain.StatusQueued,
-		Priority:       1,
-		RunAt:          started,
-		Attempts:       0,
-		MaxAttempts:    5,
-		IdempotencyKey: stringPtr("private-key"),
-		LockedBy:       stringPtr("worker-1"),
-		Result:         json.RawMessage(`{"ok":true}`),
-		CreatedAt:      started,
-		UpdatedAt:      started,
-		StartedAt:      &started,
-		FinishedAt:     &finished,
+		ID:                uuid.New(),
+		TenantID:          uuid.New(),
+		JobType:           "report.generate",
+		Payload:           json.RawMessage(`{"secret":"value"}`),
+		Status:            domain.StatusQueued,
+		Priority:          1,
+		RunAt:             started,
+		Attempts:          0,
+		MaxAttempts:       5,
+		IdempotencyKey:    stringPtr("private-key"),
+		LockedBy:          stringPtr("worker-1"),
+		Result:            json.RawMessage(`{"ok":true}`),
+		CreatedAt:         started,
+		UpdatedAt:         started,
+		StartedAt:         &started,
+		FinishedAt:        &finished,
+		CancelRequestedAt: &cancelRequested,
 	}
 
 	response := NewJobResponse(job)
@@ -43,6 +45,9 @@ func TestNewJobResponse(t *testing.T) {
 	}
 	if response.FinishedAt == nil || response.FinishedAt.Location() != time.UTC {
 		t.Errorf("FinishedAt = %v, want UTC", response.FinishedAt)
+	}
+	if response.CancelRequestedAt == nil || response.CancelRequestedAt.Location() != time.UTC {
+		t.Errorf("CancelRequestedAt = %v, want UTC", response.CancelRequestedAt)
 	}
 
 	encoded, err := json.Marshal(response)
