@@ -19,9 +19,16 @@ type JobTypeRegistry interface {
 	Allows(jobType string) bool
 }
 
+// PayloadSchemaRegistry validates a payload against its job type's schema.
+// Registries without schema support keep the older object-only validation.
+type PayloadSchemaRegistry interface {
+	ValidatePayload(jobType string, payload json.RawMessage) error
+}
+
 // SubmitInput is the transport-independent input for submitting a job.
 type SubmitInput struct {
 	TenantID       uuid.UUID
+	CreatedByKeyID uuid.UUID
 	JobType        string
 	Payload        json.RawMessage
 	RunAt          *time.Time
@@ -91,6 +98,11 @@ func (v *Validator) Build(in SubmitInput, now time.Time) (*domain.Job, error) {
 	if err := json.Unmarshal(payload, &object); err != nil || object == nil {
 		return nil, invalid("payload must be a JSON object")
 	}
+	if schema, ok := v.registry.(PayloadSchemaRegistry); ok {
+		if err := schema.ValidatePayload(jobType, payload); err != nil {
+			return nil, invalid("payload for job_type %q is invalid: %v", jobType, err)
+		}
+	}
 
 	priority := int16(0)
 	if in.Priority != nil {
@@ -124,9 +136,16 @@ func (v *Validator) Build(in SubmitInput, now time.Time) (*domain.Job, error) {
 		}
 	}
 
+	var createdBy *uuid.UUID
+	if in.CreatedByKeyID != uuid.Nil {
+		owner := in.CreatedByKeyID
+		createdBy = &owner
+	}
+
 	job := &domain.Job{
 		ID:             uuid.New(),
 		TenantID:       in.TenantID,
+		CreatedByKeyID: createdBy,
 		JobType:        jobType,
 		Payload:        json.RawMessage(append([]byte(nil), payload...)),
 		Status:         domain.StatusQueued,

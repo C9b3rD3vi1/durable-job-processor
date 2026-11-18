@@ -162,7 +162,7 @@ func TestServiceGet(t *testing.T) {
 	repo := &fakeRepository{getJob: want}
 	service := NewService(repo, testValidator())
 
-	got, err := service.Get(context.Background(), tenantID, jobID)
+	got, err := service.Get(context.Background(), Actor{TenantID: tenantID, KeyID: uuid.New()}, jobID)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -177,10 +177,13 @@ func TestServiceGet(t *testing.T) {
 func TestServiceGetRejectsInvalidIDs(t *testing.T) {
 	service := NewService(&fakeRepository{}, testValidator())
 
-	if _, err := service.Get(context.Background(), uuid.Nil, uuid.New()); !errors.Is(err, domain.ErrInvalidArgument) {
+	if _, err := service.Get(context.Background(), Actor{KeyID: uuid.New()}, uuid.New()); !errors.Is(err, domain.ErrInvalidArgument) {
 		t.Errorf("nil tenant error = %v, want ErrInvalidArgument", err)
 	}
-	if _, err := service.Get(context.Background(), uuid.New(), uuid.Nil); !errors.Is(err, domain.ErrInvalidArgument) {
+	if _, err := service.Get(context.Background(), Actor{TenantID: uuid.New()}, uuid.New()); !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Errorf("nil key error = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := service.Get(context.Background(), Actor{TenantID: uuid.New(), KeyID: uuid.New()}, uuid.Nil); !errors.Is(err, domain.ErrInvalidArgument) {
 		t.Errorf("nil job error = %v, want ErrInvalidArgument", err)
 	}
 }
@@ -189,7 +192,7 @@ func TestServiceGetPropagatesNotFound(t *testing.T) {
 	repo := &fakeRepository{getErr: domain.ErrNotFound}
 	service := NewService(repo, testValidator())
 
-	_, err := service.Get(context.Background(), uuid.New(), uuid.New())
+	_, err := service.Get(context.Background(), Actor{TenantID: uuid.New(), KeyID: uuid.New()}, uuid.New())
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("Get() error = %v, want ErrNotFound", err)
 	}

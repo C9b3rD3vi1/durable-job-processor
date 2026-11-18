@@ -19,8 +19,9 @@ func TestServiceListDefaultsLimitAndCursor(t *testing.T) {
 
 	repo := &fakeRepository{listJobs: []*domain.Job{first, second, third}}
 	service := NewService(repo, testValidator())
+	actor := Actor{TenantID: tenantID, KeyID: uuid.New()}
 
-	result, err := service.List(context.Background(), tenantID, ListInput{})
+	result, err := service.List(context.Background(), actor, ListInput{})
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
@@ -35,7 +36,7 @@ func TestServiceListDefaultsLimitAndCursor(t *testing.T) {
 	}
 
 	repo.listJobs = []*domain.Job{first, second, third}
-	result, err = service.List(context.Background(), tenantID, ListInput{Limit: 2})
+	result, err = service.List(context.Background(), actor, ListInput{Limit: 2})
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
@@ -66,7 +67,7 @@ func TestServiceListPassesFiltersAndCursor(t *testing.T) {
 	repo := &fakeRepository{}
 	service := NewService(repo, testValidator())
 
-	_, err := service.List(context.Background(), tenantID, ListInput{
+	_, err := service.List(context.Background(), Actor{TenantID: tenantID, KeyID: uuid.New()}, ListInput{
 		Status:        &status,
 		JobType:       " report.generate ",
 		CreatedAfter:  &after,
@@ -120,7 +121,8 @@ func TestServiceListRejectsInvalidInput(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := service.List(context.Background(), tt.tenant, tt.in); !errors.Is(err, domain.ErrInvalidArgument) {
+			actor := Actor{TenantID: tt.tenant, KeyID: uuid.New()}
+			if _, err := service.List(context.Background(), actor, tt.in); !errors.Is(err, domain.ErrInvalidArgument) {
 				t.Errorf("List() error = %v, want ErrInvalidArgument", err)
 			}
 		})
@@ -146,11 +148,12 @@ func TestCursorRoundTrip(t *testing.T) {
 func TestServiceCancel(t *testing.T) {
 	tenantID := uuid.New()
 	jobID := uuid.New()
-	want := &domain.Job{ID: jobID, TenantID: tenantID, Status: domain.StatusRunning}
-	repo := &fakeRepository{cancelJob: want, cancelReq: true}
+	owner := uuid.New()
+	want := &domain.Job{ID: jobID, TenantID: tenantID, Status: domain.StatusRunning, CreatedByKeyID: &owner}
+	repo := &fakeRepository{cancelJob: want, cancelReq: true, getJob: want}
 	service := NewService(repo, testValidator())
 
-	got, requested, err := service.Cancel(context.Background(), tenantID, jobID)
+	got, requested, err := service.Cancel(context.Background(), Actor{TenantID: tenantID, KeyID: owner}, jobID)
 	if err != nil {
 		t.Fatalf("Cancel() error = %v", err)
 	}
@@ -169,10 +172,13 @@ func TestServiceCancelRejectsInvalidIDs(t *testing.T) {
 	repo := &fakeRepository{}
 	service := NewService(repo, testValidator())
 
-	if _, _, err := service.Cancel(context.Background(), uuid.Nil, uuid.New()); !errors.Is(err, domain.ErrInvalidArgument) {
+	if _, _, err := service.Cancel(context.Background(), Actor{KeyID: uuid.New()}, uuid.New()); !errors.Is(err, domain.ErrInvalidArgument) {
 		t.Errorf("nil tenant error = %v, want ErrInvalidArgument", err)
 	}
-	if _, _, err := service.Cancel(context.Background(), uuid.New(), uuid.Nil); !errors.Is(err, domain.ErrInvalidArgument) {
+	if _, _, err := service.Cancel(context.Background(), Actor{TenantID: uuid.New()}, uuid.New()); !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Errorf("nil key error = %v, want ErrInvalidArgument", err)
+	}
+	if _, _, err := service.Cancel(context.Background(), Actor{TenantID: uuid.New(), KeyID: uuid.New()}, uuid.Nil); !errors.Is(err, domain.ErrInvalidArgument) {
 		t.Errorf("nil job error = %v, want ErrInvalidArgument", err)
 	}
 	if repo.cancelCalls != 0 {
@@ -199,6 +205,69 @@ func TestServiceSubmitPropagatesQuotaExceeded(t *testing.T) {
 	_, _, err := service.Submit(context.Background(), validInput())
 	if !errors.Is(err, domain.ErrQuotaExceeded) {
 		t.Fatalf("Submit() error = %v, want ErrQuotaExceeded", err)
+	}
+}
+
+func TestServiceGetEnforcesOwnerOrOperator(t *testing.T) {
+	tenantID := uuid.New()
+	owner := uuid.New()
+	job := &domain.Job{ID: uuid.New(), TenantID: tenantID, CreatedByKeyID: &owner}
+	service := NewService(&fakeRepository{getJob: job}, testValidator())
+
+	if _, err := service.Get(context.Background(), Actor{TenantID: tenantID, KeyID: owner}, job.ID); err != nil {
+		t.Errorf("owner Get() error = %v, want nil", err)
+	}
+	if _, err := service.Get(context.Background(), Actor{TenantID: tenantID, KeyID: uuid.New(), IsOperator: true}, job.ID); err != nil {
+		t.Errorf("operator Get() error = %v, want nil", err)
+	}
+	_, err := service.Get(context.Background(), Actor{TenantID: tenantID, KeyID: uuid.New()}, job.ID)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("other client Get() error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestServiceListSetsOwnerFilter(t *testing.T) {
+	tenantID := uuid.New()
+	owner := uuid.New()
+	repo := &fakeRepository{}
+	service := NewService(repo, testValidator())
+
+	if _, err := service.List(context.Background(), Actor{TenantID: tenantID, KeyID: owner}, ListInput{}); err != nil {
+		t.Fatalf("client List() error = %v", err)
+	}
+	if repo.gotFilter.OwnerKeyID == nil || *repo.gotFilter.OwnerKeyID != owner || repo.gotFilter.AnyOwner {
+		t.Errorf("client filter = %+v, want owner %v", repo.gotFilter, owner)
+	}
+
+	if _, err := service.List(context.Background(), Actor{TenantID: tenantID, KeyID: uuid.New(), IsOperator: true}, ListInput{}); err != nil {
+		t.Fatalf("operator List() error = %v", err)
+	}
+	if !repo.gotFilter.AnyOwner || repo.gotFilter.OwnerKeyID != nil {
+		t.Errorf("operator filter = %+v, want unfiltered owner", repo.gotFilter)
+	}
+}
+
+func TestServiceCancelEnforcesOwnerOrOperator(t *testing.T) {
+	tenantID := uuid.New()
+	owner := uuid.New()
+	job := &domain.Job{ID: uuid.New(), TenantID: tenantID, Status: domain.StatusQueued, CreatedByKeyID: &owner}
+	repo := &fakeRepository{getJob: job, cancelJob: job}
+	service := NewService(repo, testValidator())
+	other := Actor{TenantID: tenantID, KeyID: uuid.New()}
+
+	if _, _, err := service.Cancel(context.Background(), other, job.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("other client Cancel() error = %v, want ErrNotFound", err)
+	}
+	if repo.cancelCalls != 0 {
+		t.Errorf("unauthorized cancel reached the repository %d times", repo.cancelCalls)
+	}
+
+	operator := Actor{TenantID: tenantID, KeyID: uuid.New(), IsOperator: true}
+	if _, _, err := service.Cancel(context.Background(), operator, job.ID); err != nil {
+		t.Errorf("operator Cancel() error = %v", err)
+	}
+	if repo.cancelCalls != 1 {
+		t.Errorf("CancelJob calls = %d, want 1", repo.cancelCalls)
 	}
 }
 

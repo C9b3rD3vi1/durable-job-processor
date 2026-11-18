@@ -29,6 +29,9 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("RECOVERY_INTERVAL", "45s")
 	t.Setenv("MAX_ATTEMPTS", "7")
 	t.Setenv("MAX_PAYLOAD_BYTES", "1024")
+	t.Setenv("TENANT_MAX_OUTSTANDING_JOBS", "50")
+	t.Setenv("TENANT_RATE_LIMIT_PER_MINUTE", "70")
+	t.Setenv("TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE", "20")
 }
 
 func TestLoad(t *testing.T) {
@@ -69,8 +72,52 @@ func TestLoad(t *testing.T) {
 	if cfg.MaxAttempts != 7 || cfg.MaxPayloadBytes != 1024 {
 		t.Errorf("limits = %d/%d, want 7/1024", cfg.MaxAttempts, cfg.MaxPayloadBytes)
 	}
+	if cfg.TenantMaxOutstandingJobs != 50 || cfg.TenantRateLimitPerMinute != 70 ||
+		cfg.TenantSubmitRateLimitPerMinute != 20 {
+		t.Errorf("tenant limits = %d/%d/%d, want 50/70/20",
+			cfg.TenantMaxOutstandingJobs, cfg.TenantRateLimitPerMinute,
+			cfg.TenantSubmitRateLimitPerMinute)
+	}
 	if got, want := cfg.RequestBodyLimit(), int64(1024+64*1024); got != want {
 		t.Errorf("RequestBodyLimit() = %d, want %d", got, want)
+	}
+}
+
+func TestLoadRateLimitDefaults(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("TENANT_MAX_OUTSTANDING_JOBS", "")
+	t.Setenv("TENANT_RATE_LIMIT_PER_MINUTE", "")
+	t.Setenv("TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.TenantMaxOutstandingJobs != 1000 {
+		t.Errorf("TenantMaxOutstandingJobs = %d, want 1000", cfg.TenantMaxOutstandingJobs)
+	}
+	if cfg.TenantRateLimitPerMinute != 600 {
+		t.Errorf("TenantRateLimitPerMinute = %d, want 600", cfg.TenantRateLimitPerMinute)
+	}
+	if cfg.TenantSubmitRateLimitPerMinute != 120 {
+		t.Errorf("TenantSubmitRateLimitPerMinute = %d, want 120", cfg.TenantSubmitRateLimitPerMinute)
+	}
+}
+
+func TestLoadRejectsNegativeRateLimits(t *testing.T) {
+	for _, key := range []string{
+		"TENANT_MAX_OUTSTANDING_JOBS",
+		"TENANT_RATE_LIMIT_PER_MINUTE",
+		"TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE",
+	} {
+		t.Run(key, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv(key, "-1")
+
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil, want an error for %s=-1", key)
+			}
+		})
 	}
 }
 

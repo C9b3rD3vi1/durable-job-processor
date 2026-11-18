@@ -89,6 +89,15 @@ func TestValidatorBuildRejectsInvalidInput(t *testing.T) {
 		{"missing type", func(in *SubmitInput, _ *Validator) { in.JobType = " " }},
 		{"invalid type format", func(in *SubmitInput, _ *Validator) { in.JobType = "Report Generate" }},
 		{"unsupported type", func(in *SubmitInput, _ *Validator) { in.JobType = "unknown.job" }},
+		{"payload fails job schema", func(in *SubmitInput, _ *Validator) { in.Payload = json.RawMessage(`{}`) }},
+		{"wrong job schema", func(in *SubmitInput, _ *Validator) {
+			in.JobType = "email.send"
+			in.Payload = json.RawMessage(`{"to":"not-an-address"}`)
+		}},
+		{"webhook schema", func(in *SubmitInput, _ *Validator) {
+			in.JobType = "webhook.deliver"
+			in.Payload = json.RawMessage(`{"url":"file:///tmp/hook"}`)
+		}},
 		{"missing payload", func(in *SubmitInput, _ *Validator) { in.Payload = nil }},
 		{"invalid json", func(in *SubmitInput, _ *Validator) { in.Payload = json.RawMessage(`{`) }},
 		{"array payload", func(in *SubmitInput, _ *Validator) { in.Payload = json.RawMessage(`[1,2]`) }},
@@ -117,6 +126,22 @@ func TestValidatorBuildRejectsInvalidInput(t *testing.T) {
 				t.Fatalf("Build() error = %v, want ErrInvalidJob", err)
 			}
 		})
+	}
+}
+
+func TestValidatorBuildReportsSchemaFailure(t *testing.T) {
+	input := validInput()
+	input.Payload = json.RawMessage(`{"report_id":""}`)
+
+	_, err := testValidator().Build(input, time.Now())
+	if err == nil {
+		t.Fatal("Build() error = nil, want a schema error")
+	}
+	if !errors.Is(err, domain.ErrInvalidJob) {
+		t.Errorf("Build() error = %v, want ErrInvalidJob", err)
+	}
+	if !strings.Contains(err.Error(), "payload for job_type") {
+		t.Errorf("Build() error = %v, want the job_type in the message", err)
 	}
 }
 

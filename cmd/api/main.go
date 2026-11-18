@@ -69,12 +69,13 @@ func run() error {
 	authenticator := auth.NewAuthenticator(postgres.NewAPIKeyRepository(pool))
 
 	router := httpapi.NewRouter(httpapi.Options{
-		JobService:         service,
-		Pinger:             pool,
-		Authenticator:      authenticator,
-		Logger:             logger,
-		MaxBodyBytes:       cfg.RequestBodyLimit(),
-		RateLimitPerMinute: cfg.TenantRateLimitPerMinute,
+		JobService:               service,
+		Pinger:                   pool,
+		Authenticator:            authenticator,
+		Logger:                   logger,
+		MaxBodyBytes:             cfg.RequestBodyLimit(),
+		RateLimitPerMinute:       cfg.TenantRateLimitPerMinute,
+		SubmitRateLimitPerMinute: cfg.TenantSubmitRateLimitPerMinute,
 	})
 
 	server := &http.Server{

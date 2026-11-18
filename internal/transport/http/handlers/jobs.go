@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/auth"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/jobs"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/transport/http/dto"
@@ -22,10 +23,20 @@ import (
 // JobService is the HTTP-facing subset of the job service.
 type JobService interface {
 	Submit(ctx context.Context, in jobs.SubmitInput) (*domain.Job, bool, error)
-	Get(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, error)
-	List(ctx context.Context, tenantID uuid.UUID, in jobs.ListInput) (*jobs.ListResult, error)
-	Cancel(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, bool, error)
+	Get(ctx context.Context, actor jobs.Actor, id uuid.UUID) (*domain.Job, error)
+	List(ctx context.Context, actor jobs.Actor, in jobs.ListInput) (*jobs.ListResult, error)
+	Cancel(ctx context.Context, actor jobs.Actor, id uuid.UUID) (*domain.Job, bool, error)
 	Replay(ctx context.Context, tenantID, id uuid.UUID, replayedBy string) (*domain.Job, error)
+}
+
+// actorFromIdentity carries verified API key identity into the service layer.
+// No client-controlled field can influence tenant, key or operator status.
+func actorFromIdentity(identity auth.Identity) jobs.Actor {
+	return jobs.Actor{
+		TenantID:   identity.TenantID,
+		KeyID:      identity.KeyID,
+		IsOperator: identity.IsOperator(),
+	}
 }
 
 // JobsHandler implements the job submission and lookup endpoints.
@@ -74,6 +85,7 @@ func (h *JobsHandler) CreateJob(w http.ResponseWriter, r *http.Request) {
 
 	job, created, err := h.service.Submit(r.Context(), jobs.SubmitInput{
 		TenantID:       tenantID,
+		CreatedByKeyID: identity.KeyID,
 		JobType:        req.JobType,
 		Payload:        req.Payload,
 		RunAt:          req.ScheduledAt,
@@ -112,7 +124,7 @@ func (h *JobsHandler) GetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := h.service.Get(r.Context(), tenantID, id)
+	job, err := h.service.Get(r.Context(), actorFromIdentity(identity), id)
 	if err != nil {
 		h.handleServiceError(w, r, tenantID, id, err)
 		return
@@ -157,7 +169,7 @@ func (h *JobsHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
 		in.Limit = limit
 	}
 
-	result, err := h.service.List(r.Context(), identity.TenantID, in)
+	result, err := h.service.List(r.Context(), actorFromIdentity(identity), in)
 	if err != nil {
 		h.handleServiceError(w, r, identity.TenantID, uuid.Nil, err)
 		return
@@ -181,7 +193,7 @@ func (h *JobsHandler) CancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, cooperative, err := h.service.Cancel(r.Context(), identity.TenantID, id)
+	job, cooperative, err := h.service.Cancel(r.Context(), actorFromIdentity(identity), id)
 	if err != nil {
 		h.handleServiceError(w, r, identity.TenantID, id, err)
 		return

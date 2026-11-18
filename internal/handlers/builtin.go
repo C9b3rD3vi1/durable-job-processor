@@ -22,7 +22,8 @@ const (
 )
 
 // DefaultRegistry registers the job types supported by this implementation.
-// The API uses it as an allow-list; workers use the same registry to dispatch.
+// The API uses it as the allow-list and payload-schema source; workers use the
+// same registry to dispatch.
 func DefaultRegistry() *Registry {
 	registry := New()
 	builtins := map[string]Handler{
@@ -47,20 +48,33 @@ type reportGeneratePayload struct {
 	Format   string `json:"format"`
 }
 
-// Execute validates the payload and returns a bounded report result.
-func (ReportGenerateHandler) Execute(_ context.Context, job domain.Job) (json.RawMessage, error) {
+func validateReportGeneratePayload(raw json.RawMessage) (reportGeneratePayload, error) {
 	var payload reportGeneratePayload
-	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return nil, fmt.Errorf("decode report.generate payload: %w", err)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return payload, fmt.Errorf("decode report.generate payload: %w", err)
 	}
 	payload.ReportID = strings.TrimSpace(payload.ReportID)
 	if payload.ReportID == "" {
-		return nil, errors.New("report.generate requires report_id")
+		return payload, errors.New("report.generate requires report_id")
 	}
 	if payload.Format = strings.TrimSpace(payload.Format); payload.Format == "" {
 		payload.Format = "pdf"
 	}
+	return payload, nil
+}
 
+// ValidatePayload rejects malformed reports before they enter the queue.
+func (ReportGenerateHandler) ValidatePayload(payload json.RawMessage) error {
+	_, err := validateReportGeneratePayload(payload)
+	return err
+}
+
+// Execute returns a bounded report result.
+func (ReportGenerateHandler) Execute(_ context.Context, job domain.Job) (json.RawMessage, error) {
+	payload, err := validateReportGeneratePayload(job.Payload)
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(map[string]any{
 		"report_id": payload.ReportID,
 		"format":    payload.Format,
@@ -76,17 +90,30 @@ type emailSendPayload struct {
 	Template string `json:"template"`
 }
 
-// Execute validates the recipient and returns a delivery result.
-func (EmailSendHandler) Execute(_ context.Context, job domain.Job) (json.RawMessage, error) {
+func validateEmailSendPayload(raw json.RawMessage) (emailSendPayload, error) {
 	var payload emailSendPayload
-	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return nil, fmt.Errorf("decode email.send payload: %w", err)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return payload, fmt.Errorf("decode email.send payload: %w", err)
 	}
 	payload.To = strings.TrimSpace(payload.To)
 	if payload.To == "" || !strings.Contains(payload.To, "@") {
-		return nil, errors.New("email.send requires a valid to address")
+		return payload, errors.New("email.send requires a valid to address")
 	}
+	return payload, nil
+}
 
+// ValidatePayload rejects malformed recipients before they enter the queue.
+func (EmailSendHandler) ValidatePayload(payload json.RawMessage) error {
+	_, err := validateEmailSendPayload(payload)
+	return err
+}
+
+// Execute returns a delivery result.
+func (EmailSendHandler) Execute(_ context.Context, job domain.Job) (json.RawMessage, error) {
+	payload, err := validateEmailSendPayload(job.Payload)
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(map[string]any{
 		"to":        payload.To,
 		"template":  payload.Template,
@@ -103,17 +130,30 @@ type dataImportPayload struct {
 	Format string `json:"format"`
 }
 
-// Execute validates the source and returns an import result.
-func (DataImportHandler) Execute(_ context.Context, job domain.Job) (json.RawMessage, error) {
+func validateDataImportPayload(raw json.RawMessage) (dataImportPayload, error) {
 	var payload dataImportPayload
-	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return nil, fmt.Errorf("decode data.import payload: %w", err)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return payload, fmt.Errorf("decode data.import payload: %w", err)
 	}
 	payload.Source = strings.TrimSpace(payload.Source)
 	if payload.Source == "" {
-		return nil, errors.New("data.import requires source")
+		return payload, errors.New("data.import requires source")
 	}
+	return payload, nil
+}
 
+// ValidatePayload rejects imports with no source before they enter the queue.
+func (DataImportHandler) ValidatePayload(payload json.RawMessage) error {
+	_, err := validateDataImportPayload(payload)
+	return err
+}
+
+// Execute returns an import result.
+func (DataImportHandler) Execute(_ context.Context, job domain.Job) (json.RawMessage, error) {
+	payload, err := validateDataImportPayload(job.Payload)
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(map[string]any{
 		"source": payload.Source,
 		"format": payload.Format,
@@ -132,27 +172,44 @@ type webhookDeliverPayload struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
-// Execute performs the webhook request and requires a 2xx response.
-func (h *WebhookDeliverHandler) Execute(ctx context.Context, job domain.Job) (json.RawMessage, error) {
+func validateWebhookDeliverPayload(raw json.RawMessage) (webhookDeliverPayload, error) {
 	var payload webhookDeliverPayload
-	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return nil, fmt.Errorf("decode webhook.deliver payload: %w", err)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return payload, fmt.Errorf("decode webhook.deliver payload: %w", err)
 	}
 
 	target, err := url.Parse(strings.TrimSpace(payload.URL))
 	if err != nil || target.Host == "" {
-		return nil, errors.New("webhook.deliver requires a valid url")
+		return payload, errors.New("webhook.deliver requires a valid url")
 	}
 	if target.Scheme != "http" && target.Scheme != "https" {
-		return nil, errors.New("webhook.deliver requires an http or https url")
+		return payload, errors.New("webhook.deliver requires an http or https url")
 	}
 
 	body := bytes.TrimSpace(payload.Body)
+	if len(body) > 0 && !json.Valid(body) {
+		return payload, errors.New("webhook.deliver body must be valid JSON")
+	}
+	return payload, nil
+}
+
+// ValidatePayload rejects invalid URLs and bodies before they enter the queue.
+func (h *WebhookDeliverHandler) ValidatePayload(payload json.RawMessage) error {
+	_, err := validateWebhookDeliverPayload(payload)
+	return err
+}
+
+// Execute performs the webhook request and requires a 2xx response.
+func (h *WebhookDeliverHandler) Execute(ctx context.Context, job domain.Job) (json.RawMessage, error) {
+	payload, err := validateWebhookDeliverPayload(job.Payload)
+	if err != nil {
+		return nil, err
+	}
+
+	target, _ := url.Parse(strings.TrimSpace(payload.URL))
+	body := bytes.TrimSpace(payload.Body)
 	if len(body) == 0 {
 		body = json.RawMessage(`{}`)
-	}
-	if !json.Valid(body) {
-		return nil, errors.New("webhook.deliver body must be valid JSON")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(body))

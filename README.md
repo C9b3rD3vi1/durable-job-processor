@@ -7,9 +7,11 @@ and retrieval, a worker that executes typed handlers with bounded concurrency,
 the reliability layer (expiring leases, heartbeats, lease-token fencing,
 expired-job recovery, jittered retries, dead-lettering and audited manual
 replay), hashed API keys that derive tenant and role from verified identity,
-cursor-paginated job listing, cooperative cancellation, per-tenant outstanding
-quotas and in-memory per-tenant rate limits. Observability and the delivery
-pipeline remain for later phases.
+owner-or-operator authorization for job inspection and cancellation,
+submission-time payload schema validation, cursor-paginated job listing,
+cooperative cancellation, per-tenant outstanding quotas and independent
+in-memory budgets for general traffic and job submissions. Observability and the
+delivery pipeline remain for later phases.
 
 ## What works in Phases 2–3
 
@@ -47,8 +49,8 @@ pipeline remain for later phases.
 - Idempotent submission via the `Idempotency-Key` header. A replay returns the
   existing job with `200` and `Idempotent-Replayed: true`.
 - `GET /v1/jobs/{id}` — tenant-scoped lookup that survives process restarts.
-- JSON-object payloads, allow-listed job types, priority bounds, per-job maximum
-  attempts and payload-size limits.
+- JSON-object payloads validated against each job type's schema, allow-listed job
+  types, priority bounds, per-job maximum attempts and payload-size limits.
 - Versioned, embedded SQL migrations with an advisory lock and `schema_migrations`.
 - PostgreSQL connection pooling, startup ping and graceful shutdown.
 - `GET /health/live` and `GET /health/ready`.
@@ -60,15 +62,23 @@ pipeline remain for later phases.
   plaintext key is printed once at creation.
 - The request tenant comes from the authenticated key, never from a header or
   payload. `X-Tenant-ID` is no longer accepted.
-- Two roles: `client` can submit and read jobs; `operator` can additionally
-  replay dead-letter jobs.
+- Two roles: `client` submits jobs and inspects/cancels only the jobs it created;
+  `operator` can inspect, cancel and replay any job in its tenant, including
+  dead-letter jobs.
 - Immediate revocation: a revoked key stops authenticating on the next request.
 - `cmd/apikey` provisions, lists and revokes keys without exposing digests.
 - Missing, malformed, unknown and revoked keys return `401`; a valid key without
   the operator role receives `403` on replay.
-- `GET /v1/jobs` lists only the authenticated tenant's jobs with opaque keyset
-  pagination ordered by `(created_at DESC, id DESC)` and filters for `status`,
-  `job_type`, `created_after` and `created_before`.
+- Submission validates the payload against the registered handler's schema, so
+  malformed jobs return `400 invalid_job` instead of dead-lettering later at
+  execution time.
+- Each job records the API key that created it. A different `client` key's
+  read/cancel request returns `404`; jobs without a recorded creator (created
+  before attribution or inserted directly) remain tenant-visible.
+- `GET /v1/jobs` lists the authenticated tenant's jobs (only those created by the
+  client key, all of them for an operator) with opaque keyset pagination ordered
+  by `(created_at DESC, id DESC)` and filters for `status`, `job_type`,
+  `created_after` and `created_before`.
 - `POST /v1/jobs/{id}/cancel` cancels queued and retry-wait jobs immediately. A
   running job receives a durable cancellation request that its worker observes
   on the next heartbeat, cancels the handler context and fences the attempt as
@@ -78,7 +88,9 @@ pipeline remain for later phases.
   requests cannot overshoot the quota; an idempotent replay is not a new job and
   does not consume quota.
 - A per-tenant fixed-window request rate limit runs after authentication and
-  returns `429` with `Retry-After` when a tenant exceeds its budget.
+  returns `429` with `Retry-After` when a tenant exceeds its budget. Job
+  submissions also carry a separate, tighter per-tenant budget so submission
+  bursts cannot spend the general request allowance.
 
 Job payloads are deliberately omitted from API responses to avoid exposing
 sensitive data. Lease fields and idempotency keys are internal.
@@ -160,9 +172,9 @@ go run ./cmd/apikey revoke -tenant "$TENANT_ID" -name reporting-client
 ```
 
 Key names are unique within a tenant. If a key is lost, revoke it and create a
-replacement; there is no recovery path by design. Rate limits are applied per
-tenant by the API instance, while outstanding-job quotas are enforced durably in
-PostgreSQL and shared by every API replica.
+replacement; there is no recovery path by design. Both the general and submission
+rate limits are applied per tenant by the API instance, while outstanding-job
+quotas are enforced durably in PostgreSQL and shared by every API replica.
 
 ## API examples
 
@@ -198,6 +210,9 @@ Expected response: `202 Accepted` with a `Location` header and a body such as:
   "updated_at": "2026-11-15T09:00:00Z"
 }
 ```
+
+Payloads that fail the registered handler's schema return `400` with error code
+`invalid_job`, and no job is persisted.
 
 Retrieve it:
 
@@ -236,10 +251,15 @@ on the worker's next heartbeat, and the attempt is fenced to `cancelled`. A job
 that already reached `succeeded`, `dead` or `cancelled` is not cancellable and
 returns `409`. Cancelling an already cancelled job is idempotent.
 
+Read and cancel requests follow an owner-or-operator policy: a `client` key can
+act only on jobs it submitted, while an `operator` key can act on any job in its
+tenant. Other client keys receive `404` so ownership cannot be probed.
+
 When a tenant is at `TENANT_MAX_OUTSTANDING_JOBS`, submission returns `429` with
 error code `quota_exceeded`. Completing, cancelling or dead-lettering a job frees
-quota. When the request budget is exhausted, the API returns `429` with error
-code `rate_limited` and a `Retry-After` header.
+quota. When the general request budget or the tighter submission budget is
+exhausted, the API returns `429` with error code `rate_limited` and a
+`Retry-After` header.
 
 Supported job types and their built-in handlers:
 
@@ -360,6 +380,7 @@ records a retry for work that could not finish.
 | `MAX_PAYLOAD_BYTES` | `262144` | Maximum JSON payload size |
 | `TENANT_MAX_OUTSTANDING_JOBS` | `1000` | Queued, running and retry-wait jobs per tenant; `0` disables |
 | `TENANT_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant API requests per fixed minute; `0` disables |
+| `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE` | `120` | Per-tenant `POST /v1/jobs` requests per fixed minute, in addition to the general limit; `0` disables |
 
 `LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`. `HANDLER_TIMEOUT` may
 exceed the lease because heartbeats keep the lease alive for the whole handler.
@@ -465,7 +486,7 @@ docs/architecture/       Architecture blueprint and diagrams
 | 3 — Concurrency and bounded pool | Implemented with Phase 2 |
 | 4 — Leases, heartbeat and recovery | Implemented with Phase 3 |
 | 5 — Retry, dead-letter and replay | Implemented with Phase 3 |
-| 6 — Authentication and tenant hardening | Implemented: API keys, listing, cancellation, quotas and rate limits |
+| 6 — Authentication and tenant hardening | Implemented: API keys, owner/operator authz, schema validation, listing, cancellation, quotas and separate rate limits |
 | 7 — Observability | Planned |
 | 8 — Containers and CI | Planned |
 | 9 — AWS and Terraform | Planned |

@@ -34,6 +34,10 @@ type Job struct {
 	MaxAttempts    int             `json:"max_attempts"`
 	IdempotencyKey *string         `json:"idempotency_key,omitempty"`
 
+	// CreatedByKeyID is the verified API key that submitted the job. It is an
+	// internal authorization attribute and is never exposed by the public DTO.
+	CreatedByKeyID *uuid.UUID `json:"created_by_api_key_id,omitempty"`
+
 	LockedBy    *string    `json:"locked_by,omitempty"`
 	LeaseToken  *uuid.UUID `json:"lease_token,omitempty"`
 	LockedUntil *time.Time `json:"locked_until,omitempty"`

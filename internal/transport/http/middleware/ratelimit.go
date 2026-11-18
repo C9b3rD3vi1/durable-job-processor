@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,11 +88,18 @@ func (l *RateLimiter) pruneLocked(now time.Time) {
 
 // RateLimit rejects requests over a tenant's fixed-window budget. It must run
 // after RequireAuth so the tenant is a verified identity rather than a header.
-func RateLimit(limiter *RateLimiter, logger *slog.Logger) func(http.Handler) http.Handler {
+// An optional scope distinguishes independent budgets (for example submissions
+// from general API traffic) in log messages and error responses.
+func RateLimit(limiter *RateLimiter, logger *slog.Logger, scope ...string) func(http.Handler) http.Handler {
 	if limiter == nil || limiter.limit <= 0 {
 		return func(next http.Handler) http.Handler {
 			return next
 		}
+	}
+
+	label := "request"
+	if len(scope) > 0 && strings.TrimSpace(scope[0]) != "" {
+		label = strings.TrimSpace(scope[0])
 	}
 
 	return func(next http.Handler) http.Handler {
@@ -119,11 +127,13 @@ func RateLimit(limiter *RateLimiter, logger *slog.Logger) func(http.Handler) htt
 				logger.Warn("tenant rate limit exceeded",
 					"tenant_id", identity.TenantID,
 					"api_key_id", identity.KeyID,
+					"scope", label,
 					"retry_after_seconds", seconds,
 					"path", r.URL.Path,
 				)
 			}
-			writeError(w, http.StatusTooManyRequests, "rate_limited", "tenant request rate limit exceeded")
+			writeError(w, http.StatusTooManyRequests, "rate_limited",
+				"tenant "+label+" rate limit exceeded")
 		})
 	}
 }

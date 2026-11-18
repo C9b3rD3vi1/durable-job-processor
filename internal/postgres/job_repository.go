@@ -27,6 +27,7 @@ const jobColumns = `
 	attempts,
 	max_attempts,
 	idempotency_key,
+	created_by_api_key_id::text,
 	locked_by,
 	lease_token::text,
 	locked_until,
@@ -134,9 +135,10 @@ func (r *JobRepository) createJob(ctx context.Context, q rowQuerier, job *domain
 	const query = `
 		INSERT INTO jobs (
 			id, tenant_id, job_type, payload, status, priority, run_at,
-			attempts, max_attempts, idempotency_key, created_at, updated_at
+			attempts, max_attempts, idempotency_key, created_by_api_key_id,
+			created_at, updated_at
 		)
-		VALUES ($1, $2, $3, $4::jsonb, $5::job_status, $6, $7, $8, $9, $10, now(), now())
+		VALUES ($1, $2, $3, $4::jsonb, $5::job_status, $6, $7, $8, $9, $10, $11, now(), now())
 		ON CONFLICT (tenant_id, idempotency_key)
 			WHERE idempotency_key IS NOT NULL
 			DO NOTHING
@@ -153,6 +155,7 @@ func (r *JobRepository) createJob(ctx context.Context, q rowQuerier, job *domain
 		job.Attempts,
 		job.MaxAttempts,
 		job.IdempotencyKey,
+		job.CreatedByKeyID,
 	))
 	if err == nil {
 		return created, true, nil
@@ -196,6 +199,15 @@ func (r *JobRepository) ListJobs(ctx context.Context, tenantID uuid.UUID, filter
 
 	args := []any{tenantID.String()}
 	where := []string{"tenant_id = $1"}
+
+	if !filter.AnyOwner {
+		if filter.OwnerKeyID == nil || *filter.OwnerKeyID == uuid.Nil {
+			return nil, fmt.Errorf("%w: owner key id is required for client listings", domain.ErrInvalidArgument)
+		}
+		args = append(args, filter.OwnerKeyID.String())
+		where = append(where, fmt.Sprintf(
+			"(created_by_api_key_id IS NULL OR created_by_api_key_id = $%d)", len(args)))
+	}
 
 	if filter.Status != nil {
 		args = append(args, string(*filter.Status))
@@ -375,13 +387,14 @@ func getByIdempotencyKey(ctx context.Context, q rowQuerier, tenantID uuid.UUID, 
 
 func scanJob(row pgx.Row) (*domain.Job, error) {
 	var (
-		job        domain.Job
-		id         string
-		tenantID   string
-		status     string
-		payload    []byte
-		leaseToken *string
-		result     []byte
+		job            domain.Job
+		id             string
+		tenantID       string
+		status         string
+		payload        []byte
+		leaseToken     *string
+		createdByKeyID *string
+		result         []byte
 	)
 
 	err := row.Scan(
@@ -395,6 +408,7 @@ func scanJob(row pgx.Row) (*domain.Job, error) {
 		&job.Attempts,
 		&job.MaxAttempts,
 		&job.IdempotencyKey,
+		&createdByKeyID,
 		&job.LockedBy,
 		&leaseToken,
 		&job.LockedUntil,
@@ -433,6 +447,13 @@ func scanJob(row pgx.Row) (*domain.Job, error) {
 			return nil, fmt.Errorf("parse lease token: %w", err)
 		}
 		job.LeaseToken = &token
+	}
+	if createdByKeyID != nil {
+		owner, err := uuid.Parse(*createdByKeyID)
+		if err != nil {
+			return nil, fmt.Errorf("parse created-by key id: %w", err)
+		}
+		job.CreatedByKeyID = &owner
 	}
 
 	return &job, nil

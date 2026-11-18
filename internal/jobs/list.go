@@ -37,12 +37,12 @@ type ListResult struct {
 }
 
 // List returns a tenant-scoped page ordered newest first.
-func (s *Service) List(ctx context.Context, tenantID uuid.UUID, in ListInput) (*ListResult, error) {
+func (s *Service) List(ctx context.Context, actor Actor, in ListInput) (*ListResult, error) {
 	if s.repo == nil {
 		return nil, fmt.Errorf("job repository is not configured")
 	}
-	if tenantID == uuid.Nil {
-		return nil, fmt.Errorf("%w: tenant_id is required", domain.ErrInvalidArgument)
+	if err := actor.validate(); err != nil {
+		return nil, err
 	}
 
 	limit := in.Limit
@@ -70,6 +70,12 @@ func (s *Service) List(ctx context.Context, tenantID uuid.UUID, in ListInput) (*
 		CreatedAfter:  utcPointer(in.CreatedAfter),
 		CreatedBefore: utcPointer(in.CreatedBefore),
 	}
+	if actor.IsOperator {
+		filter.AnyOwner = true
+	} else {
+		owner := actor.KeyID
+		filter.OwnerKeyID = &owner
+	}
 
 	if cursor := strings.TrimSpace(in.Cursor); cursor != "" {
 		decoded, err := decodeCursor(cursor)
@@ -81,7 +87,7 @@ func (s *Service) List(ctx context.Context, tenantID uuid.UUID, in ListInput) (*
 	}
 
 	// Fetch one extra row so the presence of a next page is unambiguous.
-	list, err := s.repo.ListJobs(ctx, tenantID, filter, limit+1)
+	list, err := s.repo.ListJobs(ctx, actor.TenantID, filter, limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -95,20 +101,28 @@ func (s *Service) List(ctx context.Context, tenantID uuid.UUID, in ListInput) (*
 	return &ListResult{Jobs: list, NextCursor: nextCursor}, nil
 }
 
-// Cancel requests cancellation of a tenant-scoped job. The boolean reports
-// whether the job is running and cancellation is cooperative rather than
-// already applied.
-func (s *Service) Cancel(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, bool, error) {
+// Cancel requests cancellation of a job the caller is authorized to act on.
+// The boolean reports whether the job is running and cancellation is
+// cooperative rather than already applied. Another client key's job is hidden
+// as 404 so ownership cannot be probed through the cancel endpoint.
+func (s *Service) Cancel(ctx context.Context, actor Actor, id uuid.UUID) (*domain.Job, bool, error) {
 	if s.repo == nil {
 		return nil, false, fmt.Errorf("job repository is not configured")
 	}
-	if tenantID == uuid.Nil {
-		return nil, false, fmt.Errorf("%w: tenant_id is required", domain.ErrInvalidArgument)
+	if err := actor.validate(); err != nil {
+		return nil, false, err
 	}
 	if id == uuid.Nil {
 		return nil, false, fmt.Errorf("%w: job id is required", domain.ErrInvalidArgument)
 	}
-	return s.repo.CancelJob(ctx, tenantID, id)
+	existing, err := s.repo.GetJobByID(ctx, actor.TenantID, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if !actor.canAccess(existing) {
+		return nil, false, fmt.Errorf("%w: job not found", domain.ErrNotFound)
+	}
+	return s.repo.CancelJob(ctx, actor.TenantID, id)
 }
 
 type cursor struct {

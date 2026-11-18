@@ -61,18 +61,26 @@ func (s *Service) Submit(ctx context.Context, in SubmitInput) (*domain.Job, bool
 	return s.repo.CreateJob(ctx, job, s.maxOutstandingJobs)
 }
 
-// Get returns a tenant-scoped job.
-func (s *Service) Get(ctx context.Context, tenantID, id uuid.UUID) (*domain.Job, error) {
+// Get returns a job the caller is authorized to inspect. Jobs owned by another
+// client key are hidden as 404 rather than revealing their existence.
+func (s *Service) Get(ctx context.Context, actor Actor, id uuid.UUID) (*domain.Job, error) {
 	if s.repo == nil {
 		return nil, fmt.Errorf("job repository is not configured")
 	}
-	if tenantID == uuid.Nil {
-		return nil, fmt.Errorf("%w: tenant_id is required", domain.ErrInvalidArgument)
+	if err := actor.validate(); err != nil {
+		return nil, err
 	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("%w: job id is required", domain.ErrInvalidArgument)
 	}
-	return s.repo.GetJobByID(ctx, tenantID, id)
+	job, err := s.repo.GetJobByID(ctx, actor.TenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if !actor.canAccess(job) {
+		return nil, fmt.Errorf("%w: job not found", domain.ErrNotFound)
+	}
+	return job, nil
 }
 
 // Replay returns an eligible dead job to retry_wait. replayedBy is the operator

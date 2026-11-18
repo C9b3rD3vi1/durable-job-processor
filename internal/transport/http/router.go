@@ -21,12 +21,13 @@ type Pinger interface {
 
 // Options contains the router dependencies.
 type Options struct {
-	JobService         handlers.JobService
-	Pinger             Pinger
-	Authenticator      auth.TokenAuthenticator
-	Logger             *slog.Logger
-	MaxBodyBytes       int64
-	RateLimitPerMinute int
+	JobService               handlers.JobService
+	Pinger                   Pinger
+	Authenticator            auth.TokenAuthenticator
+	Logger                   *slog.Logger
+	MaxBodyBytes             int64
+	RateLimitPerMinute       int
+	SubmitRateLimitPerMinute int
 }
 
 // NewRouter builds the HTTP handler tree.
@@ -39,14 +40,22 @@ func NewRouter(opts Options) http.Handler {
 	jobsHandler := handlers.NewJobsHandler(opts.JobService, logger, opts.MaxBodyBytes)
 	authenticated := middleware.RequireAuth(opts.Authenticator, logger)
 	rateLimited := middleware.RateLimit(middleware.NewRateLimiter(opts.RateLimitPerMinute, time.Minute), logger)
+	submitRateLimited := middleware.RateLimit(
+		middleware.NewRateLimiter(opts.SubmitRateLimitPerMinute, time.Minute), logger, "submission")
 	// Authentication runs before the per-tenant rate limiter so the tenant is
 	// always a verified identity and unknown keys never consume a budget.
 	authorized := func(next http.Handler) http.Handler {
 		return authenticated(rateLimited(next))
 	}
+	// Job submissions share the general budget and also carry their own,
+	// tighter budget. The submission budget is checked first so an exhausted
+	// submission quota does not consume general request capacity.
+	submissionAuthorized := func(next http.Handler) http.Handler {
+		return authenticated(submitRateLimited(rateLimited(next)))
+	}
 	mux := http.NewServeMux()
 
-	mux.Handle("POST /v1/jobs", authorized(http.HandlerFunc(jobsHandler.CreateJob)))
+	mux.Handle("POST /v1/jobs", submissionAuthorized(http.HandlerFunc(jobsHandler.CreateJob)))
 	mux.Handle("GET /v1/jobs", authorized(http.HandlerFunc(jobsHandler.ListJobs)))
 	mux.Handle("GET /v1/jobs/{id}", authorized(http.HandlerFunc(jobsHandler.GetJob)))
 	mux.Handle("POST /v1/jobs/{id}/cancel", authorized(http.HandlerFunc(jobsHandler.CancelJob)))

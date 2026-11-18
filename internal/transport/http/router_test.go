@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ type fakeService struct {
 	getJob    *domain.Job
 	getErr    error
 	gotTenant uuid.UUID
+	gotActor  jobs.Actor
 	gotID     uuid.UUID
 
 	replayJob     *domain.Job
@@ -53,8 +55,9 @@ func (f *fakeService) Submit(_ context.Context, in jobs.SubmitInput) (*domain.Jo
 	return f.submitJob, f.submitCreated, f.submitErr
 }
 
-func (f *fakeService) Get(_ context.Context, tenantID, id uuid.UUID) (*domain.Job, error) {
-	f.gotTenant = tenantID
+func (f *fakeService) Get(_ context.Context, actor jobs.Actor, id uuid.UUID) (*domain.Job, error) {
+	f.gotTenant = actor.TenantID
+	f.gotActor = actor
 	f.gotID = id
 	return f.getJob, f.getErr
 }
@@ -66,14 +69,16 @@ func (f *fakeService) Replay(_ context.Context, tenantID, id uuid.UUID, replayed
 	return f.replayJob, f.replayErr
 }
 
-func (f *fakeService) List(_ context.Context, tenantID uuid.UUID, in jobs.ListInput) (*jobs.ListResult, error) {
-	f.gotTenant = tenantID
+func (f *fakeService) List(_ context.Context, actor jobs.Actor, in jobs.ListInput) (*jobs.ListResult, error) {
+	f.gotTenant = actor.TenantID
+	f.gotActor = actor
 	f.gotList = in
 	return f.listResult, f.listErr
 }
 
-func (f *fakeService) Cancel(_ context.Context, tenantID, id uuid.UUID) (*domain.Job, bool, error) {
-	f.gotTenant = tenantID
+func (f *fakeService) Cancel(_ context.Context, actor jobs.Actor, id uuid.UUID) (*domain.Job, bool, error) {
+	f.gotTenant = actor.TenantID
+	f.gotActor = actor
 	f.gotID = id
 	return f.cancelJob, f.cancelRequest, f.cancelErr
 }
@@ -455,6 +460,99 @@ func TestRateLimitIsPerTenant(t *testing.T) {
 	}
 	if response.Error.Code != "rate_limited" {
 		t.Errorf("error code = %q, want rate_limited", response.Error.Code)
+	}
+}
+
+func TestSubmissionRateLimitIsSeparateFromGeneralLimit(t *testing.T) {
+	tenantID := uuid.New()
+	service := &fakeService{
+		submitJob:     sampleJob(tenantID),
+		submitCreated: true,
+		listResult:    &jobs.ListResult{},
+	}
+	router := NewRouter(Options{
+		JobService:               service,
+		Pinger:                   fakePinger{},
+		Authenticator:            testAuthenticator(tenantID),
+		Logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBodyBytes:             1 << 20,
+		RateLimitPerMinute:       0, // disabled: only the submission budget applies
+		SubmitRateLimitPerMinute: 2,
+	})
+
+	body := `{"job_type":"report.generate","payload":{"report_id":"r-1"}}`
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(body))
+		authenticate(req, clientToken)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("submit %d status = %d, want 202; body=%s", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(body))
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-limit submit status = %d, want 429; body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After header is empty on submission rejection")
+	}
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "rate_limited" {
+		t.Errorf("error code = %q, want rate_limited", response.Error.Code)
+	}
+	if !strings.Contains(response.Error.Message, "submission") {
+		t.Errorf("error message = %q, want it to identify the submission budget", response.Error.Message)
+	}
+
+	// The exhausted submission budget must not block ordinary reads.
+	readReq := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+	authenticate(readReq, clientToken)
+	readRec := httptest.NewRecorder()
+	router.ServeHTTP(readRec, readReq)
+	if readRec.Code != http.StatusOK {
+		t.Errorf("GET after exhausted submit budget status = %d, want 200", readRec.Code)
+	}
+}
+
+func TestSubmissionStillSharesGeneralLimit(t *testing.T) {
+	tenantID := uuid.New()
+	service := &fakeService{
+		submitJob:     sampleJob(tenantID),
+		submitCreated: true,
+	}
+	router := NewRouter(Options{
+		JobService:               service,
+		Pinger:                   fakePinger{},
+		Authenticator:            testAuthenticator(tenantID),
+		Logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxBodyBytes:             1 << 20,
+		RateLimitPerMinute:       1,
+		SubmitRateLimitPerMinute: 100,
+	})
+
+	body := `{"job_type":"report.generate","payload":{"report_id":"r-1"}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(body))
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("first submit status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewBufferString(body))
+	authenticate(req, clientToken)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second submit status = %d, want 429 from the general budget; body=%s", rec.Code, rec.Body.String())
 	}
 }
 

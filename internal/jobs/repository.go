@@ -45,4 +45,10 @@ type ListFilter struct {
 	CreatedBefore *time.Time
 	AfterCreated  *time.Time
 	AfterID       *uuid.UUID
+
+	// OwnerKeyID restricts a listing to jobs created by one client key. Jobs
+	// without a recorded creator stay visible. AnyOwner skips the restriction
+	// for operators.
+	OwnerKeyID *uuid.UUID
+	AnyOwner   bool
 }

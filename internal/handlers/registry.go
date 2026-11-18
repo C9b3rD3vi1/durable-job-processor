@@ -21,6 +21,13 @@ type Handler interface {
 	Execute(ctx context.Context, job domain.Job) (json.RawMessage, error)
 }
 
+// PayloadValidator is implemented by handlers that can check a job payload
+// before submission. It lets the API reject malformed jobs with 400 instead of
+// accepting them and dead-lettering them later at execution time.
+type PayloadValidator interface {
+	ValidatePayload(payload json.RawMessage) error
+}
+
 // HandlerFunc adapts a function to the Handler interface.
 type HandlerFunc func(ctx context.Context, job domain.Job) (json.RawMessage, error)
 
@@ -78,6 +85,23 @@ func (r *Registry) Handler(jobType string) (Handler, bool) {
 	}
 	handler, ok := r.handlers[jobType]
 	return handler, ok
+}
+
+// ValidatePayload applies a handler's submission-time schema when it has one.
+// Handlers without a validator accept any structurally valid JSON object.
+func (r *Registry) ValidatePayload(jobType string, payload json.RawMessage) error {
+	if r == nil {
+		return nil
+	}
+	handler, ok := r.handlers[strings.TrimSpace(jobType)]
+	if !ok {
+		return fmt.Errorf("unsupported job type %q", jobType)
+	}
+	validator, ok := handler.(PayloadValidator)
+	if !ok {
+		return nil
+	}
+	return validator.ValidatePayload(payload)
 }
 
 // Types returns registered job types in sorted order.
