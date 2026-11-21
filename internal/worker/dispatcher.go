@@ -12,6 +12,7 @@ import (
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/retry"
 )
 
@@ -38,6 +39,11 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 		logger.Error("claimed job has no lease token")
 		return
 	}
+
+	jobType := observability.L("job_type", job.JobType)
+	r.metrics.Inc(observability.MetricJobAttemptsTotal, jobType)
+	r.metrics.Add(observability.MetricWorkerActive, 1)
+	defer r.metrics.Add(observability.MetricWorkerActive, -1)
 
 	handler, ok := r.registry.Handler(job.JobType)
 	if !ok {
@@ -77,9 +83,13 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 	}()
 
 	started := time.Now()
+	if !job.CreatedAt.IsZero() && started.After(job.CreatedAt) {
+		r.metrics.Observe(observability.MetricJobWaitDuration, started.Sub(job.CreatedAt).Seconds(), jobType)
+	}
 	result, err := invokeHandler(handlerCtx, handler, *job)
 	timedOut := errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
 	elapsed := time.Since(started)
+	r.metrics.Observe(observability.MetricJobExecutionDuration, elapsed.Seconds(), jobType)
 
 	stopHeartbeat()
 	<-heartbeatDone
@@ -137,6 +147,7 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 		}
 		return
 	}
+	r.metrics.Inc(observability.MetricJobsCompletedTotal, jobType)
 	logger.Info("job succeeded", "duration", elapsed.String())
 }
 
@@ -161,6 +172,7 @@ func (r *Runner) heartbeat(ctx context.Context, job *domain.Job, onLost, onCance
 				if ctx.Err() != nil {
 					return
 				}
+				r.metrics.Inc(observability.MetricHeartbeatFailures)
 				r.logger.Error("heartbeat job",
 					"worker_id", r.workerID,
 					"job_id", job.ID,
@@ -217,10 +229,14 @@ func (r *Runner) fail(ctx context.Context, job *domain.Job, logger *slog.Logger,
 		return false
 	}
 
+	r.metrics.Inc(observability.MetricJobsFailedTotal,
+		observability.L("job_type", job.JobType), observability.L("class", retry.Classify(cause).String()))
 	if retryDelay <= 0 || job.Attempts >= job.MaxAttempts {
+		r.metrics.Inc(observability.MetricJobsDeadTotal, observability.L("job_type", job.JobType))
 		logger.Error("job dead-lettered", "error", message)
 		return true
 	}
+	r.metrics.Inc(observability.MetricJobsRetriedTotal, observability.L("job_type", job.JobType))
 	logger.Warn("job failed; retry scheduled",
 		"error", message,
 		"retry_in", retryDelay.String(),

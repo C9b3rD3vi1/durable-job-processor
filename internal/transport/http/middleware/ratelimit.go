@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/google/uuid"
 )
 
@@ -91,6 +92,12 @@ func (l *RateLimiter) pruneLocked(now time.Time) {
 // An optional scope distinguishes independent budgets (for example submissions
 // from general API traffic) in log messages and error responses.
 func RateLimit(limiter *RateLimiter, logger *slog.Logger, scope ...string) func(http.Handler) http.Handler {
+	return RateLimitWithMetrics(limiter, logger, nil, scope...)
+}
+
+// RateLimitWithMetrics is RateLimit with a counter for rejected requests. The
+// scope label distinguishes the general and submission budgets.
+func RateLimitWithMetrics(limiter *RateLimiter, logger *slog.Logger, metrics *observability.Metrics, scope ...string) func(http.Handler) http.Handler {
 	if limiter == nil || limiter.limit <= 0 {
 		return func(next http.Handler) http.Handler {
 			return next
@@ -117,6 +124,8 @@ func RateLimit(limiter *RateLimiter, logger *slog.Logger, scope ...string) func(
 				next.ServeHTTP(w, r)
 				return
 			}
+
+			metrics.Inc(observability.MetricRateLimitedTotal, observability.L("scope", label))
 
 			seconds := int(math.Ceil(retryAfter.Seconds()))
 			if seconds < 1 {

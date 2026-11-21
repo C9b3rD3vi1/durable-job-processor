@@ -68,6 +68,26 @@ func (r *JobRepository) ClaimJob(ctx context.Context, workerID string, leaseDura
 	return job, nil
 }
 
+// QueueStats reports the due backlog using the same eligibility predicate as
+// ClaimJob. The database clock computes the oldest age so worker clock skew
+// cannot distort backlog alerts.
+func (r *JobRepository) QueueStats(ctx context.Context) (queue.Stats, error) {
+	const query = `
+		SELECT count(*)::bigint,
+		       COALESCE(EXTRACT(EPOCH FROM (now() - min(run_at)))::float8, 0)
+		FROM jobs
+		WHERE status IN ('queued', 'retry_wait')
+		  AND run_at <= now()
+		  AND attempts < max_attempts
+		  AND cancel_requested_at IS NULL`
+
+	var stats queue.Stats
+	if err := r.pool.QueryRow(ctx, query).Scan(&stats.Depth, &stats.OldestDueSeconds); err != nil {
+		return queue.Stats{}, fmt.Errorf("queue stats: %w", err)
+	}
+	return stats, nil
+}
+
 // CompleteJob records success only when the caller still holds the lease.
 func (r *JobRepository) CompleteJob(ctx context.Context, id, leaseToken uuid.UUID, result json.RawMessage) (bool, error) {
 	if id == uuid.Nil || leaseToken == uuid.Nil {

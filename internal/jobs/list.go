@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/google/uuid"
 )
 
@@ -122,7 +123,12 @@ func (s *Service) Cancel(ctx context.Context, actor Actor, id uuid.UUID) (*domai
 	if !actor.canAccess(existing) {
 		return nil, false, fmt.Errorf("%w: job not found", domain.ErrNotFound)
 	}
-	return s.repo.CancelJob(ctx, actor.TenantID, id)
+	job, cooperative, err := s.repo.CancelJob(ctx, actor.TenantID, id)
+	if err == nil && job != nil {
+		s.metrics.Inc(observability.MetricJobsCancelledTotal,
+			observability.L("job_type", jobTypeLabel(job.JobType)))
+	}
+	return job, cooperative, err
 }
 
 type cursor struct {

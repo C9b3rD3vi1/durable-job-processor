@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/config"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
@@ -34,6 +35,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create logger: %w", err)
 	}
+	metrics := observability.NewMetrics()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -59,9 +61,13 @@ func run() error {
 	}
 
 	runner, err := worker.New(worker.Config{
-		Store:             postgres.NewJobRepository(pool),
-		Registry:          handlers.DefaultRegistry(),
+		Store: postgres.NewJobRepository(pool),
+		Registry: handlers.DefaultRegistryWithWebhookPolicy(handlers.WebhookEgressPolicy{
+			AllowedHosts:    cfg.WebhookAllowedHosts,
+			AllowPrivateIPs: cfg.WebhookAllowPrivateIPs,
+		}),
 		Logger:            logger,
+		Metrics:           metrics,
 		WorkerID:          workerID(),
 		Concurrency:       cfg.WorkerConcurrency,
 		PollInterval:      cfg.PollInterval,
@@ -75,6 +81,24 @@ func run() error {
 	})
 	if err != nil {
 		return fmt.Errorf("create worker: %w", err)
+	}
+
+	if cfg.MetricsEnabled {
+		go func() {
+			if err := observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics); err != nil {
+				logger.Error("metrics server stopped", "error", err)
+			}
+		}()
+		go observability.PollPoolStats(ctx, 15*time.Second, func() observability.PoolStats {
+			stat := pool.Stat()
+			return observability.PoolStats{
+				InUse:     int64(stat.AcquiredConns()),
+				Idle:      int64(stat.IdleConns()),
+				WaitCount: stat.EmptyAcquireCount(),
+				MaxConns:  int64(stat.MaxConns()),
+			}
+		}, metrics)
+		logger.Info("metrics endpoint enabled", "addr", cfg.MetricsAddr)
 	}
 
 	return runner.Run(ctx)

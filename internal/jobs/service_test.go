@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/google/uuid"
 )
 
@@ -141,6 +145,32 @@ func TestServiceSubmitValidatesBeforeRepository(t *testing.T) {
 	}
 	if repo.createCalls != 0 {
 		t.Errorf("CreateJob calls = %d, want 0", repo.createCalls)
+	}
+}
+
+func TestServiceRecordsSubmissionMetrics(t *testing.T) {
+	metrics := observability.NewMetrics()
+	service := NewService(&fakeRepository{}, testValidator(), WithMetrics(metrics))
+
+	if _, _, err := service.Submit(context.Background(), validInput()); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	invalid := validInput()
+	invalid.JobType = "unknown.job"
+	if _, _, err := service.Submit(context.Background(), invalid); !errors.Is(err, domain.ErrInvalidJob) {
+		t.Fatalf("Submit() error = %v, want ErrInvalidJob", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	metrics.Handler("").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`jobs_submitted_total{job_type="report.generate",result="created"} 1`,
+		`jobs_submitted_total{job_type="invalid",result="rejected"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q\n%s", want, body)
+		}
 	}
 }
 

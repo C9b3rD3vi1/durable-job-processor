@@ -381,9 +381,63 @@ records a retry for work that could not finish.
 | `TENANT_MAX_OUTSTANDING_JOBS` | `1000` | Queued, running and retry-wait jobs per tenant; `0` disables |
 | `TENANT_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant API requests per fixed minute; `0` disables |
 | `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE` | `120` | Per-tenant `POST /v1/jobs` requests per fixed minute, in addition to the general limit; `0` disables |
+| `WEBHOOK_ALLOWED_HOSTS` | empty | Optional comma-separated webhook destination allow-list; a leading `.` permits subdomains |
+| `WEBHOOK_ALLOW_PRIVATE_IPS` | `false` | Allows loopback/private/link-local webhook destinations for local tests only |
+| `METRICS_ENABLED` | `true` | Serve Prometheus metrics from a dedicated listener in the API and worker |
+| `METRICS_ADDR` | `127.0.0.1:9090` | Metrics listener address; give API and worker different ports when running both locally |
+| `METRICS_TOKEN` | empty | Required bearer token when `METRICS_ADDR` is not loopback |
 
 `LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`. `HANDLER_TIMEOUT` may
 exceed the lease because heartbeats keep the lease alive for the whole handler.
+
+### Webhook egress controls
+
+`webhook.deliver` treats the job payload as untrusted. By default the zero-value
+egress policy allows only public HTTP(S) destinations and rejects loopback, RFC
+1918, link-local (including `169.254.169.254`), multicast, carrier-grade NAT,
+reserved and documentation addresses. Hostnames are resolved at dial time and
+every resolved IP is checked, which prevents DNS rebinding. Redirects are not
+followed, URL credentials are rejected, and caller-supplied headers are limited
+to `Accept`, `User-Agent`, `X-Webhook-Event`, `X-Webhook-Delivery`,
+`X-Request-Id` and `X-Idempotency-Key`.
+
+For local development against an `httptest` server, set
+`WEBHOOK_ALLOW_PRIVATE_IPS=true`. Never enable it in production. Use
+`WEBHOOK_ALLOWED_HOSTS` (for example `hooks.example.com,.internal.example.org`)
+for an additional hostname allow-list; an empty list permits any public host.
+
+### Metrics
+
+Both binaries expose a Prometheus text-format endpoint at `GET /metrics` on
+`METRICS_ADDR` (default `127.0.0.1:9090`). Because the default binds to loopback
+only, it is private by default. To let Prometheus scrape from another host or
+container, bind to `:9090` and set `METRICS_TOKEN`; the endpoint then requires
+`Authorization: Bearer <METRICS_TOKEN>`. Startup fails if a non-loopback
+`METRICS_ADDR` is configured without a token. Give the API and worker distinct
+ports when running them on the same host.
+
+Instrumented series include:
+
+- `api_http_requests_total{method,route,status}` and
+  `api_http_request_duration_seconds` with normalized route labels
+- `api_rate_limited_total{scope}` for general and submission budgets
+- `jobs_submitted_total{job_type,result}`, `jobs_completed_total`,
+  `jobs_failed_total{job_type,class}`, `jobs_retried_total`,
+  `jobs_dead_lettered_total`, `jobs_replayed_total`, `jobs_cancelled_total`
+- `job_attempts_total`, `job_wait_duration_seconds`,
+  `job_execution_duration_seconds`, `worker_active_count`
+- `worker_heartbeat_failures_total`, `worker_expired_leases_total{outcome}`
+- `jobs_queue_depth`, `jobs_oldest_due_seconds` (PostgreSQL-derived backlog gauges)
+- `db_pool_in_use`, `db_pool_idle`, `db_pool_wait_count`, `db_pool_max_conns`
+
+Metrics are process-local; each API/worker replica exposes its own registry, so
+scrape each instance with its own `instance` label. Queue gauges are computed
+once in PostgreSQL but published by every worker: aggregate them with `max()`,
+not `sum()`.
+
+Prometheus scrape configuration, starter alert rules, dashboard queries and the
+on-call runbook are in [`docs/monitoring`](docs/monitoring/README.md) and
+[`monitoring/prometheus/alerts.yml`](monitoring/prometheus/alerts.yml).
 
 ## Database migrations
 
@@ -449,7 +503,8 @@ The integration suite verifies:
 - recovery finalizes a pending cancellation after a lease expires;
 - outstanding quotas reject excess submissions atomically and idempotent
   replays bypass the quota;
-- the API maps quota exhaustion to `429 quota_exceeded`.
+- the API maps quota exhaustion to `429 quota_exceeded`;
+- queue backlog gauges match claim eligibility and use the PostgreSQL clock.
 
 Phase 2–3 claim and concurrency tests run in throwaway PostgreSQL schemas, so
 they do not depend on or disturb development data. Integration tests are skipped
@@ -475,6 +530,8 @@ internal/transport/http/ Router, handlers, DTOs and middleware
 migrations/              Embedded versioned SQL migrations
 tests/integration/       PostgreSQL-backed API and worker tests
 docs/architecture/       Architecture blueprint and diagrams
+docs/monitoring/         Scrape, dashboard, alert and runbook guidance
+monitoring/prometheus/   Starter Prometheus alert rules
 ```
 
 ## Roadmap
@@ -487,7 +544,7 @@ docs/architecture/       Architecture blueprint and diagrams
 | 4 — Leases, heartbeat and recovery | Implemented with Phase 3 |
 | 5 — Retry, dead-letter and replay | Implemented with Phase 3 |
 | 6 — Authentication and tenant hardening | Implemented: API keys, owner/operator authz, schema validation, listing, cancellation, quotas and separate rate limits |
-| 7 — Observability | Planned |
+| 7 — Observability | Implemented: structured logs, health checks, Prometheus `/metrics`, queue gauges, starter alerts, runbooks and dashboard queries |
 | 8 — Containers and CI | Planned |
 | 9 — AWS and Terraform | Planned |
 | 10 — Kubernetes lab | Planned |

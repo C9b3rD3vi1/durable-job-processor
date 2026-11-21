@@ -30,6 +30,12 @@ func decodeResult(t *testing.T, result json.RawMessage) map[string]any {
 	return decoded
 }
 
+// localWebhookHandler opts into loopback egress for httptest servers. The
+// zero-value production policy never permits loopback destinations.
+func localWebhookHandler() *WebhookDeliverHandler {
+	return NewWebhookDeliverHandler(WebhookEgressPolicy{AllowPrivateIPs: true})
+}
+
 func TestReportGenerateHandler(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -138,7 +144,7 @@ func TestWebhookDeliverHandlerSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotContentType = r.Header.Get("Content-Type")
-		gotHeader = r.Header.Get("X-Test")
+		gotHeader = r.Header.Get("X-Webhook-Event")
 		body, _ := io.ReadAll(r.Body)
 		gotBody = string(body)
 		w.WriteHeader(http.StatusNoContent)
@@ -148,13 +154,13 @@ func TestWebhookDeliverHandlerSuccess(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{
 		"url":     server.URL,
 		"body":    map[string]any{"event": "created"},
-		"headers": map[string]string{"X-Test": "yes"},
+		"headers": map[string]string{"X-Webhook-Event": "created"},
 	})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
 
-	result, err := (&WebhookDeliverHandler{}).Execute(context.Background(), testJob("webhook.deliver", string(payload)))
+	result, err := localWebhookHandler().Execute(context.Background(), testJob("webhook.deliver", string(payload)))
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -171,8 +177,8 @@ func TestWebhookDeliverHandlerSuccess(t *testing.T) {
 	if gotContentType != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", gotContentType)
 	}
-	if gotHeader != "yes" {
-		t.Errorf("X-Test = %q, want yes", gotHeader)
+	if gotHeader != "created" {
+		t.Errorf("X-Webhook-Event = %q, want created", gotHeader)
 	}
 	if gotBody != `{"event":"created"}` {
 		t.Errorf("body = %s, want {\"event\":\"created\"}", gotBody)
@@ -188,7 +194,7 @@ func TestWebhookDeliverHandlerDefaultsBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	result, err := (&WebhookDeliverHandler{}).Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
+	result, err := localWebhookHandler().Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -207,7 +213,7 @@ func TestWebhookDeliverHandlerFailureIsSanitized(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := (&WebhookDeliverHandler{}).Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
+	_, err := localWebhookHandler().Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
 	if err == nil {
 		t.Fatal("Execute() error = nil, want error")
 	}
@@ -228,7 +234,7 @@ func TestWebhookDeliverHandlerClientErrorIsPermanent(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := (&WebhookDeliverHandler{}).Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
+	_, err := localWebhookHandler().Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
 	if err == nil {
 		t.Fatal("Execute() error = nil, want error")
 	}
@@ -250,7 +256,7 @@ func TestWebhookDeliverHandlerValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := (&WebhookDeliverHandler{}).Execute(context.Background(), testJob("webhook.deliver", tt.payload))
+			_, err := localWebhookHandler().Execute(context.Background(), testJob("webhook.deliver", tt.payload))
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("Execute() error = %v, want containing %q", err, tt.wantErr)
 			}
@@ -265,7 +271,8 @@ func TestWebhookDeliverHandlerTimeout(t *testing.T) {
 	}))
 	defer server.Close()
 
-	handler := &WebhookDeliverHandler{Client: &http.Client{Timeout: 20 * time.Millisecond}}
+	handler := localWebhookHandler()
+	handler.Client = &http.Client{Timeout: 20 * time.Millisecond}
 	_, err := handler.Execute(context.Background(), testJob("webhook.deliver", `{"url":"`+server.URL+`"}`))
 	if err == nil || !strings.Contains(err.Error(), "request failed") {
 		t.Fatalf("Execute() error = %v, want sanitized request failure", err)

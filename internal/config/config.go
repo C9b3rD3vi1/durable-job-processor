@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ const (
 	defaultTenantMaxOutstandingJobs       = 1000
 	defaultTenantRateLimitPerMinute       = 600
 	defaultTenantSubmitRateLimitPerMinute = 120
+	defaultMetricsAddr                    = "127.0.0.1:9090"
 )
 
 // Config is the complete runtime configuration for the API and worker binaries.
@@ -59,6 +61,18 @@ type Config struct {
 	TenantMaxOutstandingJobs       int
 	TenantRateLimitPerMinute       int
 	TenantSubmitRateLimitPerMinute int
+
+	// Webhook egress controls. AllowedHosts is an optional allow-list; an empty
+	// list permits any public host. AllowPrivateIPs is for local development
+	// and tests only and must stay false in production.
+	WebhookAllowedHosts    []string
+	WebhookAllowPrivateIPs bool
+
+	// Metrics are served on a dedicated listener. Loopback binding is the
+	// default; exposing it on a routable interface requires METRICS_TOKEN.
+	MetricsEnabled bool
+	MetricsAddr    string
+	MetricsToken   string
 }
 
 // Load reads configuration from environment variables and validates it.
@@ -140,6 +154,15 @@ func Load() (Config, error) {
 	if cfg.AutoMigrate, err = envBool("AUTO_MIGRATE", false); err != nil {
 		return Config{}, err
 	}
+	cfg.WebhookAllowedHosts = envStringList("WEBHOOK_ALLOWED_HOSTS")
+	if cfg.WebhookAllowPrivateIPs, err = envBool("WEBHOOK_ALLOW_PRIVATE_IPS", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.MetricsEnabled, err = envBool("METRICS_ENABLED", true); err != nil {
+		return Config{}, err
+	}
+	cfg.MetricsAddr = envString("METRICS_ADDR", defaultMetricsAddr)
+	cfg.MetricsToken = strings.TrimSpace(os.Getenv("METRICS_TOKEN"))
 
 	if cfg.DBMaxConns < 1 {
 		return Config{}, fmt.Errorf("DB_MAX_CONNS must be at least 1")
@@ -189,6 +212,15 @@ func Load() (Config, error) {
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive")
 	}
+	if cfg.MetricsEnabled {
+		host, _, err := net.SplitHostPort(cfg.MetricsAddr)
+		if err != nil {
+			return Config{}, fmt.Errorf("METRICS_ADDR must be host:port: %w", err)
+		}
+		if !loopbackHost(host) && cfg.MetricsToken == "" {
+			return Config{}, fmt.Errorf("METRICS_TOKEN is required when METRICS_ADDR is not loopback")
+		}
+	}
 	switch strings.ToLower(cfg.LogLevel) {
 	case "debug", "info", "warn", "error":
 	default:
@@ -201,6 +233,33 @@ func Load() (Config, error) {
 // RequestBodyLimit bounds the whole HTTP request, including JSON framing.
 func (c Config) RequestBodyLimit() int64 {
 	return c.MaxPayloadBytes + 64*1024
+}
+
+func loopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// envStringList parses a comma-separated environment variable into trimmed,
+// non-empty values. It is used for optional allow-lists such as webhook hosts.
+func envStringList(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	values := make([]string, 0)
+	for _, part := range strings.Split(raw, ",") {
+		if value := strings.TrimSpace(part); value != "" {
+			values = append(values, value)
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }
 
 func envString(key, fallback string) string {

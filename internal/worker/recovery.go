@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"time"
+
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 )
 
 // recoveryLoop periodically resolves running jobs whose lease expired because a
@@ -35,6 +37,15 @@ func (r *Runner) recoverExpired(ctx context.Context) {
 			r.logger.Error("recover expired jobs", "worker_id", r.workerID, "error", err)
 		}
 		return
+	}
+	if result.Requeued > 0 {
+		r.metrics.Add(observability.MetricExpiredLeases, float64(result.Requeued), observability.L("outcome", "requeued"))
+	}
+	if result.Dead > 0 {
+		r.metrics.Add(observability.MetricExpiredLeases, float64(result.Dead), observability.L("outcome", "dead"))
+	}
+	if result.Cancelled > 0 {
+		r.metrics.Add(observability.MetricExpiredLeases, float64(result.Cancelled), observability.L("outcome", "cancelled"))
 	}
 	if result.Requeued > 0 || result.Dead > 0 || result.Cancelled > 0 {
 		r.logger.Warn("recovered expired job leases",

@@ -1,0 +1,129 @@
+# Starter alert rules for the durable job processor.
+#
+# Thresholds are deliberately conservative starting points. Tune them to your
+# submission rate, handler duration and tenant SLOs after collecting a baseline.
+# Runbook: docs/monitoring/runbook.md
+#
+# Queue gauges are published by every worker from the same PostgreSQL snapshot.
+# Use max() rather than sum() so duplicated worker series are not multiplied.
+
+groups:
+  - name: durable-job-processor
+    rules:
+      - alert: DurableJobQueueBacklogHigh
+        expr: max(jobs_queue_depth) > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Durable job queue backlog is high
+          description: >-
+            The due backlog has exceeded 1000 jobs for 10 minutes. Current
+            value: {{ $value | humanize }}.
+          runbook_url: docs/monitoring/runbook.md#durablejobqueuebackloghigh
+
+      - alert: DurableJobOldestDueAgeHigh
+        expr: max(jobs_oldest_due_seconds) > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Oldest due job has been waiting more than 15 minutes
+          description: >-
+            PostgreSQL reports the oldest due job has waited {{ $value | humanizeDuration }}.
+          runbook_url: docs/monitoring/runbook.md#durablejoboldestdueagehigh
+
+      - alert: DurableJobDeadLetterSpike
+        expr: sum(increase(jobs_dead_lettered_total[15m])) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Jobs are being dead-lettered
+          description: >-
+            {{ $value | humanize }} jobs were moved to the dead state in 15 minutes.
+          runbook_url: docs/monitoring/runbook.md#durablejobdeadletterspike
+
+      - alert: DurableJobHeartbeatFailures
+        expr: sum(rate(worker_heartbeat_failures_total[10m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Worker lease heartbeats are failing
+          description: >-
+            Heartbeat failures have been sustained for 5 minutes at
+            {{ $value | humanize }} errors/second.
+          runbook_url: docs/monitoring/runbook.md#durablejobheartbeatfailures
+
+      - alert: DurableJobExpiredLeaseTerminalOutcomes
+        expr: sum by (outcome) (increase(worker_expired_leases_total{outcome=~"dead|cancelled"}[30m])) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Recovery is finalizing expired leases
+          description: >-
+            Recovery applied {{ $value | humanize }} terminal {{ $labels.outcome }}
+            outcomes to expired leases in 30 minutes.
+          runbook_url: docs/monitoring/runbook.md#durablejobexpiredleaseterminaloutcomes
+
+      - alert: DurableJobAPIHighErrorRate
+        expr: |
+          sum(rate(api_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(api_http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: API 5xx ratio is above 5%
+          description: >-
+            The API has served {{ $value | humanizePercentage }} 5xx responses over 5 minutes.
+          runbook_url: docs/monitoring/runbook.md#durablejobapihigherrorrate
+
+      - alert: DurableJobMetricsUnavailable
+        expr: up{job=~"durable-job-(api|worker)"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Durable job processor metrics cannot be scraped
+          description: >-
+            Prometheus has not scraped {{ $labels.job }} on {{ $labels.instance }}
+            for 5 minutes. Check the listener, network policy and bearer token.
+          runbook_url: docs/monitoring/runbook.md#durablejobmetricsunavailable
+
+      - alert: DurableJobRateLimitSpike
+        expr: sum(increase(api_rate_limited_total[15m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Tenants are being rate limited
+          description: >-
+            {{ $value | humanize }} requests were rejected by tenant rate limits in 15 minutes.
+          runbook_url: docs/monitoring/runbook.md#durablejobratelimitspike
+
+      - alert: DurableJobDBPoolSaturated
+        expr: max(db_pool_in_use / clamp_min(db_pool_max_conns, 1)) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Database connection pool is nearly saturated
+          description: >-
+            At least one process has used {{ $value | humanizePercentage }} of its
+            configured database connections for 10 minutes.
+          runbook_url: docs/monitoring/runbook.md#durablejobdbpoolsaturated
+
+      - alert: DurableJobJobWaitTimeHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(job_wait_duration_seconds_bucket[15m]))) > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: p95 job wait time is above five minutes
+          description: >-
+            The p95 delay from creation to execution is
+            {{ $value | humanizeDuration }}.
+          runbook_url: docs/monitoring/runbook.md#durablejobjobwaittimehigh

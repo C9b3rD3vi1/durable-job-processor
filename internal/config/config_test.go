@@ -212,3 +212,79 @@ func TestLoadRejectsInvalidPort(t *testing.T) {
 		t.Fatal("Load() error = nil, want error")
 	}
 }
+
+func TestLoadWebhookEgressConfig(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("WEBHOOK_ALLOWED_HOSTS", " hooks.example.com, .internal.example.org, , ")
+	t.Setenv("WEBHOOK_ALLOW_PRIVATE_IPS", "true")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"hooks.example.com", ".internal.example.org"}
+	if len(cfg.WebhookAllowedHosts) != len(want) {
+		t.Fatalf("WebhookAllowedHosts = %v, want %v", cfg.WebhookAllowedHosts, want)
+	}
+	for i := range want {
+		if cfg.WebhookAllowedHosts[i] != want[i] {
+			t.Errorf("WebhookAllowedHosts[%d] = %q, want %q", i, cfg.WebhookAllowedHosts[i], want[i])
+		}
+	}
+	if !cfg.WebhookAllowPrivateIPs {
+		t.Error("WebhookAllowPrivateIPs = false, want true")
+	}
+}
+
+func TestLoadWebhookEgressDefaults(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.WebhookAllowedHosts) != 0 {
+		t.Errorf("WebhookAllowedHosts = %v, want empty", cfg.WebhookAllowedHosts)
+	}
+	if cfg.WebhookAllowPrivateIPs {
+		t.Error("WebhookAllowPrivateIPs = true, want false")
+	}
+}
+
+func TestLoadMetricsConfig(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("METRICS_ENABLED", "true")
+	t.Setenv("METRICS_ADDR", ":19090")
+	t.Setenv("METRICS_TOKEN", "scrape-secret")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.MetricsEnabled {
+		t.Error("MetricsEnabled = false, want true")
+	}
+	if cfg.MetricsAddr != ":19090" || cfg.MetricsToken != "scrape-secret" {
+		t.Errorf("metrics config = %q/%q, want :19090/scrape-secret", cfg.MetricsAddr, cfg.MetricsToken)
+	}
+}
+
+func TestLoadMetricsDefaults(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.MetricsEnabled || cfg.MetricsAddr != "127.0.0.1:9090" {
+		t.Errorf("metrics defaults = %v/%q, want true/127.0.0.1:9090", cfg.MetricsEnabled, cfg.MetricsAddr)
+	}
+}
+
+func TestLoadRejectsUnauthenticatedPublicMetrics(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("METRICS_ADDR", ":19090")
+	t.Setenv("METRICS_TOKEN", "")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want public metrics endpoint rejected")
+	}
+}

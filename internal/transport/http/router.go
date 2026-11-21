@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/auth"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/transport/http/dto"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/transport/http/handlers"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/transport/http/middleware"
@@ -25,6 +26,7 @@ type Options struct {
 	Pinger                   Pinger
 	Authenticator            auth.TokenAuthenticator
 	Logger                   *slog.Logger
+	Metrics                  *observability.Metrics
 	MaxBodyBytes             int64
 	RateLimitPerMinute       int
 	SubmitRateLimitPerMinute int
@@ -39,9 +41,10 @@ func NewRouter(opts Options) http.Handler {
 
 	jobsHandler := handlers.NewJobsHandler(opts.JobService, logger, opts.MaxBodyBytes)
 	authenticated := middleware.RequireAuth(opts.Authenticator, logger)
-	rateLimited := middleware.RateLimit(middleware.NewRateLimiter(opts.RateLimitPerMinute, time.Minute), logger)
-	submitRateLimited := middleware.RateLimit(
-		middleware.NewRateLimiter(opts.SubmitRateLimitPerMinute, time.Minute), logger, "submission")
+	rateLimited := middleware.RateLimitWithMetrics(
+		middleware.NewRateLimiter(opts.RateLimitPerMinute, time.Minute), logger, opts.Metrics)
+	submitRateLimited := middleware.RateLimitWithMetrics(
+		middleware.NewRateLimiter(opts.SubmitRateLimitPerMinute, time.Minute), logger, opts.Metrics, "submission")
 	// Authentication runs before the per-tenant rate limiter so the tenant is
 	// always a verified identity and unknown keys never consume a budget.
 	authorized := func(next http.Handler) http.Handler {
@@ -89,6 +92,7 @@ func NewRouter(opts Options) http.Handler {
 
 	handler := middleware.SecurityHeaders(mux)
 	handler = middleware.RequestLogger(logger)(handler)
+	handler = middleware.HTTPMetrics(opts.Metrics)(handler)
 	handler = middleware.Recoverer(logger)(handler)
 	return handler
 }

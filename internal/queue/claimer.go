@@ -50,4 +50,8 @@ type Store interface {
 	// lease has expired. The operation is fenced by the scan itself and is safe
 	// to run from several workers concurrently.
 	RecoverExpiredJobs(ctx context.Context, limit int) (RecoveryResult, error)
+
+	// QueueStats reports the number of jobs ready to claim and the age of the
+	// oldest one. It is used for queue-depth and backlog-age metrics.
+	QueueStats(ctx context.Context) (Stats, error)
 }

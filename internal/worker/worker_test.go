@@ -156,6 +156,12 @@ func (s *fakeStore) RecoverExpiredJobs(_ context.Context, _ int) (queue.Recovery
 	return s.recoveryResult, nil
 }
 
+func (s *fakeStore) QueueStats(context.Context) (queue.Stats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return queue.Stats{Depth: int64(len(s.jobs)), OldestDueSeconds: 1.5}, nil
+}
+
 func (s *fakeStore) heartbeatCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -38,6 +38,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create logger: %w", err)
 	}
+	metrics := observability.NewMetrics()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -63,9 +64,14 @@ func run() error {
 	}
 
 	repository := postgres.NewJobRepository(pool)
-	validator := jobs.NewValidator(handlers.DefaultRegistry(), cfg.MaxPayloadBytes, cfg.MaxAttempts)
+	registry := handlers.DefaultRegistryWithWebhookPolicy(handlers.WebhookEgressPolicy{
+		AllowedHosts:    cfg.WebhookAllowedHosts,
+		AllowPrivateIPs: cfg.WebhookAllowPrivateIPs,
+	})
+	validator := jobs.NewValidator(registry, cfg.MaxPayloadBytes, cfg.MaxAttempts)
 	service := jobs.NewService(repository, validator,
-		jobs.WithMaxOutstandingJobs(cfg.TenantMaxOutstandingJobs))
+		jobs.WithMaxOutstandingJobs(cfg.TenantMaxOutstandingJobs),
+		jobs.WithMetrics(metrics))
 	authenticator := auth.NewAuthenticator(postgres.NewAPIKeyRepository(pool))
 
 	router := httpapi.NewRouter(httpapi.Options{
@@ -73,6 +79,7 @@ func run() error {
 		Pinger:                   pool,
 		Authenticator:            authenticator,
 		Logger:                   logger,
+		Metrics:                  metrics,
 		MaxBodyBytes:             cfg.RequestBodyLimit(),
 		RateLimitPerMinute:       cfg.TenantRateLimitPerMinute,
 		SubmitRateLimitPerMinute: cfg.TenantSubmitRateLimitPerMinute,
@@ -85,6 +92,24 @@ func run() error {
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+	}
+
+	if cfg.MetricsEnabled {
+		go func() {
+			if err := observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics); err != nil {
+				logger.Error("metrics server stopped", "error", err)
+			}
+		}()
+		go observability.PollPoolStats(ctx, 15*time.Second, func() observability.PoolStats {
+			stat := pool.Stat()
+			return observability.PoolStats{
+				InUse:     int64(stat.AcquiredConns()),
+				Idle:      int64(stat.IdleConns()),
+				WaitCount: stat.EmptyAcquireCount(),
+				MaxConns:  int64(stat.MaxConns()),
+			}
+		}, metrics)
+		logger.Info("metrics endpoint enabled", "addr", cfg.MetricsAddr)
 	}
 
 	serverErr := make(chan error, 1)

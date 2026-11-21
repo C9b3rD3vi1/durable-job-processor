@@ -29,6 +29,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		defer wg.Done()
 		r.recoveryLoop(ctx)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.statsLoop(ctx)
+	}()
 
 	r.logger.Info("worker started",
 		"worker_id", r.workerID,

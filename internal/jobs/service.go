@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/google/uuid"
 )
 
@@ -16,6 +17,7 @@ type Service struct {
 	validator          *Validator
 	now                func() time.Time
 	maxOutstandingJobs int
+	metrics            *observability.Metrics
 }
 
 // Option configures a Service.
@@ -26,6 +28,13 @@ type Option func(*Service)
 func WithMaxOutstandingJobs(limit int) Option {
 	return func(s *Service) {
 		s.maxOutstandingJobs = limit
+	}
+}
+
+// WithMetrics enables job lifecycle counters on the service.
+func WithMetrics(metrics *observability.Metrics) Option {
+	return func(s *Service) {
+		s.metrics = metrics
 	}
 }
 
@@ -56,9 +65,40 @@ func (s *Service) Submit(ctx context.Context, in SubmitInput) (*domain.Job, bool
 
 	job, err := s.validator.Build(in, s.now())
 	if err != nil {
+		// Rejected input must not become an attacker-controlled label value.
+		s.metrics.Inc(observability.MetricJobsSubmittedTotal,
+			observability.L("job_type", "invalid"), observability.L("result", "rejected"))
 		return nil, false, err
 	}
-	return s.repo.CreateJob(ctx, job, s.maxOutstandingJobs)
+
+	createdJob, created, err := s.repo.CreateJob(ctx, job, s.maxOutstandingJobs)
+	result := "replayed"
+	if created {
+		result = "created"
+	}
+	if err != nil {
+		result = "error"
+	}
+	jobType := "unknown"
+	if createdJob != nil {
+		jobType = jobTypeLabel(createdJob.JobType)
+	}
+	s.metrics.Inc(observability.MetricJobsSubmittedTotal,
+		observability.L("job_type", jobType), observability.L("result", result))
+	return createdJob, created, err
+}
+
+// jobTypeLabel bounds the job_type label even if a repository returns a job
+// whose type was not validated by this process.
+func jobTypeLabel(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	if len(value) > domain.MaxJobTypeLength {
+		return value[:domain.MaxJobTypeLength]
+	}
+	return value
 }
 
 // Get returns a job the caller is authorized to inspect. Jobs owned by another
@@ -99,5 +139,10 @@ func (s *Service) Replay(ctx context.Context, tenantID, id uuid.UUID, replayedBy
 	if replayedBy == "" {
 		return nil, fmt.Errorf("%w: replayed_by is required", domain.ErrInvalidArgument)
 	}
-	return s.repo.ReplayJob(ctx, tenantID, id, replayedBy)
+	job, err := s.repo.ReplayJob(ctx, tenantID, id, replayedBy)
+	if err == nil && job != nil {
+		s.metrics.Inc(observability.MetricJobsReplayedTotal,
+			observability.L("job_type", jobTypeLabel(job.JobType)))
+	}
+	return job, err
 }

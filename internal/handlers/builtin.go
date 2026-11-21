@@ -25,11 +25,17 @@ const (
 // The API uses it as the allow-list and payload-schema source; workers use the
 // same registry to dispatch.
 func DefaultRegistry() *Registry {
+	return DefaultRegistryWithWebhookPolicy(WebhookEgressPolicy{})
+}
+
+// DefaultRegistryWithWebhookPolicy registers the built-in handlers with an
+// explicit webhook egress policy derived from runtime configuration.
+func DefaultRegistryWithWebhookPolicy(policy WebhookEgressPolicy) *Registry {
 	registry := New()
 	builtins := map[string]Handler{
 		"report.generate": ReportGenerateHandler{},
 		"email.send":      EmailSendHandler{},
-		"webhook.deliver": &WebhookDeliverHandler{Client: &http.Client{Timeout: webhookTimeout}},
+		"webhook.deliver": NewWebhookDeliverHandler(policy),
 		"data.import":     DataImportHandler{},
 	}
 	for jobType, handler := range builtins {
@@ -161,9 +167,22 @@ func (DataImportHandler) Execute(_ context.Context, job domain.Job) (json.RawMes
 	})
 }
 
-// WebhookDeliverHandler POSTs a JSON body to a caller-supplied URL.
+// WebhookDeliverHandler POSTs a JSON body to a caller-supplied URL. Outbound
+// connections are constrained by Policy so a tenant-controlled payload cannot
+// reach internal services.
 type WebhookDeliverHandler struct {
 	Client *http.Client
+	Policy WebhookEgressPolicy
+
+	// resolver is a test seam for DNS answers; production uses the system
+	// resolver through webhookDialContext.
+	resolver ipResolver
+}
+
+// NewWebhookDeliverHandler builds a webhook handler with the supplied egress
+// policy. The zero policy allows only public HTTP(S) destinations.
+func NewWebhookDeliverHandler(policy WebhookEgressPolicy) *WebhookDeliverHandler {
+	return &WebhookDeliverHandler{Policy: policy}
 }
 
 type webhookDeliverPayload struct {
@@ -172,18 +191,35 @@ type webhookDeliverPayload struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
-func validateWebhookDeliverPayload(raw json.RawMessage) (webhookDeliverPayload, error) {
+// allowedWebhookHeaders is the complete set of request headers a job may set.
+// Routing, content-type and credential headers are deliberately excluded.
+var allowedWebhookHeaders = map[string]struct{}{
+	"accept":             {},
+	"user-agent":         {},
+	"x-webhook-event":    {},
+	"x-webhook-delivery": {},
+	"x-request-id":       {},
+	"x-idempotency-key":  {},
+}
+
+func validateWebhookDeliverPayload(policy WebhookEgressPolicy, raw json.RawMessage) (webhookDeliverPayload, error) {
 	var payload webhookDeliverPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return payload, fmt.Errorf("decode webhook.deliver payload: %w", err)
 	}
 
 	target, err := url.Parse(strings.TrimSpace(payload.URL))
-	if err != nil || target.Host == "" {
+	if err != nil {
 		return payload, errors.New("webhook.deliver requires a valid url")
 	}
-	if target.Scheme != "http" && target.Scheme != "https" {
-		return payload, errors.New("webhook.deliver requires an http or https url")
+	if err := validateWebhookTarget(policy, target); err != nil {
+		return payload, err
+	}
+
+	for name := range payload.Headers {
+		if _, allowed := allowedWebhookHeaders[strings.ToLower(strings.TrimSpace(name))]; !allowed {
+			return payload, fmt.Errorf("webhook.deliver header %q is not allowed", name)
+		}
 	}
 
 	body := bytes.TrimSpace(payload.Body)
@@ -193,15 +229,16 @@ func validateWebhookDeliverPayload(raw json.RawMessage) (webhookDeliverPayload, 
 	return payload, nil
 }
 
-// ValidatePayload rejects invalid URLs and bodies before they enter the queue.
+// ValidatePayload rejects invalid URLs, destinations and headers before they
+// enter the queue. IP-level checks are repeated at execution time.
 func (h *WebhookDeliverHandler) ValidatePayload(payload json.RawMessage) error {
-	_, err := validateWebhookDeliverPayload(payload)
+	_, err := validateWebhookDeliverPayload(h.Policy, payload)
 	return err
 }
 
 // Execute performs the webhook request and requires a 2xx response.
 func (h *WebhookDeliverHandler) Execute(ctx context.Context, job domain.Job) (json.RawMessage, error) {
-	payload, err := validateWebhookDeliverPayload(job.Payload)
+	payload, err := validateWebhookDeliverPayload(h.Policy, job.Payload)
 	if err != nil {
 		return nil, err
 	}
@@ -216,15 +253,16 @@ func (h *WebhookDeliverHandler) Execute(ctx context.Context, job domain.Job) (js
 	if err != nil {
 		return nil, errors.New("webhook.deliver could not build request")
 	}
-	req.Header.Set("Content-Type", "application/json")
 	for name, value := range payload.Headers {
 		req.Header.Set(name, value)
 	}
-
-	client := h.Client
-	if client == nil {
-		client = &http.Client{Timeout: webhookTimeout}
+	// Fixed headers are applied last so a payload cannot override them.
+	req.Header.Set("Content-Type", "application/json")
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "durable-job-processor")
 	}
+
+	client := newWebhookHTTPClient(h.Policy, h.Client, h.resolver)
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/queue"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/retry"
 )
@@ -42,6 +43,7 @@ type Config struct {
 	Store             queue.Store
 	Registry          *handlers.Registry
 	Logger            *slog.Logger
+	Metrics           *observability.Metrics
 	WorkerID          string
 	Concurrency       int
 	PollInterval      time.Duration
@@ -59,6 +61,7 @@ type Runner struct {
 	store             queue.Store
 	registry          *handlers.Registry
 	logger            *slog.Logger
+	metrics           *observability.Metrics
 	workerID          string
 	concurrency       int
 	pollInterval      time.Duration
@@ -125,6 +128,7 @@ func New(cfg Config) (*Runner, error) {
 		store:             cfg.Store,
 		registry:          cfg.Registry,
 		logger:            logger,
+		metrics:           cfg.Metrics,
 		workerID:          strings.TrimSpace(cfg.WorkerID),
 		concurrency:       cfg.Concurrency,
 		pollInterval:      cfg.PollInterval,
