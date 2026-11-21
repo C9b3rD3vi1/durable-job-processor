@@ -1,3 +1,34 @@
+name: durable-job-processor
+
+# Shared runtime configuration. DATABASE_URL uses the Compose service name, not
+# localhost, so it works from inside the API/worker/migrate containers.
+x-app-env: &app-env
+  APP_ENV: development
+  LOG_LEVEL: info
+  DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs?sslmode=disable
+  DB_MAX_CONNS: "10"
+  DB_MIN_CONNS: "0"
+  DB_CONNECT_TIMEOUT: 5s
+  AUTO_MIGRATE: "false"
+  SHUTDOWN_TIMEOUT: 15s
+  WORKER_CONCURRENCY: "4"
+  POLL_INTERVAL: 1s
+  LEASE_DURATION: 60s
+  HEARTBEAT_INTERVAL: 15s
+  HANDLER_TIMEOUT: 30s
+  RETRY_BASE_DELAY: 5s
+  RETRY_MAX_DELAY: 15m
+  RECOVERY_INTERVAL: 30s
+  MAX_ATTEMPTS: "5"
+  MAX_PAYLOAD_BYTES: "262144"
+  TENANT_MAX_OUTSTANDING_JOBS: "1000"
+  TENANT_RATE_LIMIT_PER_MINUTE: "600"
+  TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE: "120"
+  WEBHOOK_ALLOWED_HOSTS: ""
+  WEBHOOK_ALLOW_PRIVATE_IPS: "false"
+  METRICS_ENABLED: "true"
+  METRICS_TOKEN: ${METRICS_TOKEN:-local-metrics-token}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -15,5 +46,99 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrate
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  apikey:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: apikey
+    environment:
+      <<: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    environment:
+      <<: *app-env
+      HTTP_ADDR: :8080
+      METRICS_ADDR: :9090
+    ports:
+      - "8080:8080"
+      - "127.0.0.1:9092:9090"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    environment:
+      <<: *app-env
+      METRICS_ADDR: :9091
+    ports:
+      - "127.0.0.1:9093:9091"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - api
+      - worker
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   postgres-data:
+  prometheus-data:
+  grafana-data:

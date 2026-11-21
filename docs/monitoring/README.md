@@ -44,6 +44,12 @@ Omit the `authorization` block when `METRICS_TOKEN` is empty. The job names abov
 match the `DurableJobMetricsUnavailable` alert; adjust the expression if you use
 different names.
 
+The local Compose stack already loads
+[`monitoring/prometheus/prometheus.yml`](../../monitoring/prometheus/prometheus.yml),
+the alert rules and a provisioned Grafana dashboard. Its Prometheus config uses
+the development token `local-metrics-token`; change it if you override
+`METRICS_TOKEN`.
+
 Verify a target by hand:
 
 ```bash
@@ -81,7 +87,7 @@ by the worker count.
 | p95 API latency | `histogram_quantile(0.95, sum by (le) (rate(api_http_request_duration_seconds_bucket[5m])))` |
 | Active handlers | `sum(worker_active_count)` |
 | DB pool usage | `max(db_pool_in_use / clamp_min(db_pool_max_conns, 1))` |
-| DB connection waiters | `sum(rate(db_pool_wait_count[5m]))` |
+| DB connection waiters | `sum(db_pool_wait_count)` (cumulative count) |
 | API 5xx ratio | `sum(rate(api_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(api_http_requests_total[5m])), 0.001)` |
 
 Useful Grafana variables:

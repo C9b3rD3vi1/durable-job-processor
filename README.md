@@ -2,16 +2,16 @@
 
 A fault-tolerant background job processing system built with Go and PostgreSQL.
 
-**Phases 1–3 and Phase 6 tenant hardening are implemented:** durable submission
-and retrieval, a worker that executes typed handlers with bounded concurrency,
-the reliability layer (expiring leases, heartbeats, lease-token fencing,
-expired-job recovery, jittered retries, dead-lettering and audited manual
-replay), hashed API keys that derive tenant and role from verified identity,
-owner-or-operator authorization for job inspection and cancellation,
-submission-time payload schema validation, cursor-paginated job listing,
-cooperative cancellation, per-tenant outstanding quotas and independent
-in-memory budgets for general traffic and job submissions. Observability and the
-delivery pipeline remain for later phases.
+**Phases 1–8 are implemented:** durable submission and retrieval, a worker that
+executes typed handlers with bounded concurrency, the reliability layer
+(expiring leases, heartbeats, lease-token fencing, expired-job recovery,
+jittered retries, dead-lettering and audited manual replay), hashed API keys that
+derive tenant and role from verified identity, owner-or-operator authorization,
+payload schema validation, cursor-paginated listing, cooperative cancellation,
+tenant quotas and rate limits, SSRF-hardened webhook delivery, structured logs,
+health probes, Prometheus metrics with alerts and runbooks, plus Docker images,
+a Compose stack and CI. AWS/Terraform and the Kubernetes lab remain for later
+phases.
 
 ## What works in Phases 2–3
 
@@ -90,7 +90,10 @@ delivery pipeline remain for later phases.
 - A per-tenant fixed-window request rate limit runs after authentication and
   returns `429` with `Retry-After` when a tenant exceeds its budget. Job
   submissions also carry a separate, tighter per-tenant budget so submission
-  bursts cannot spend the general request allowance.
+  bursts cannot spend the general request allowance. These budgets are in-memory
+  per API process; the local stack deliberately runs one API replica. Multiple
+  replicas need a shared limiter before the effective per-tenant budget remains
+  accurate.
 
 Job payloads are deliberately omitted from API responses to avoid exposing
 sensitive data. Lease fields and idempotency keys are internal.
@@ -101,7 +104,46 @@ sensitive data. Lease fields and idempotency keys are internal.
 - PostgreSQL 14+ (16 recommended)
 - Docker/Podman Compose, or an existing PostgreSQL instance
 
-## Quick start
+## Quick start (Docker Compose)
+
+The full local stack starts with one command:
+
+```bash
+make up
+```
+
+This builds the API, worker, migration and API-key images, applies migrations,
+then starts PostgreSQL, the API, one worker, Prometheus and Grafana. The default
+endpoints are:
+
+| Service | URL | Credentials |
+|---|---|---|
+| API | http://localhost:8080 | API key required |
+| API metrics | http://localhost:9092/metrics | Bearer `local-metrics-token` |
+| Worker metrics | http://localhost:9093/metrics | Bearer `local-metrics-token` |
+| Prometheus | http://localhost:9090 | none |
+| Grafana | http://localhost:3000 | `admin` / `admin` |
+| PostgreSQL | localhost:5432 | `jobs` / `jobs` |
+
+Prometheus is preconfigured to scrape both metrics endpoints with the same
+development token. If you override `METRICS_TOKEN`, update
+`monitoring/prometheus/prometheus.yml` to match. The starter dashboard is
+provisioned into Grafana automatically.
+
+Provision an operator key after the stack is healthy:
+
+```bash
+TENANT_ID="$(uuidgen)"
+docker compose run --rm apikey create -tenant "$TENANT_ID" -name local-dev -role operator
+export API_KEY="djp_..."   # copy the key printed above
+curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/health/ready
+```
+
+Use `make down` to stop the stack. Data is kept in named Docker volumes.
+
+## Local Go development
+
+For running the binaries directly against a local PostgreSQL:
 
 ```bash
 # 1. Start PostgreSQL
@@ -402,8 +444,9 @@ to `Accept`, `User-Agent`, `X-Webhook-Event`, `X-Webhook-Delivery`,
 `X-Request-Id` and `X-Idempotency-Key`.
 
 For local development against an `httptest` server, set
-`WEBHOOK_ALLOW_PRIVATE_IPS=true`. Never enable it in production. Use
-`WEBHOOK_ALLOWED_HOSTS` (for example `hooks.example.com,.internal.example.org`)
+`WEBHOOK_ALLOW_PRIVATE_IPS=true`. Startup refuses this setting when `APP_ENV`
+is `production`, `prod` or `live`. Use `WEBHOOK_ALLOWED_HOSTS` (for example
+`hooks.example.com,.internal.example.org`)
 for an additional hostname allow-list; an empty list permits any public host.
 
 ### Metrics
@@ -437,7 +480,9 @@ not `sum()`.
 
 Prometheus scrape configuration, starter alert rules, dashboard queries and the
 on-call runbook are in [`docs/monitoring`](docs/monitoring/README.md) and
-[`monitoring/prometheus/alerts.yml`](monitoring/prometheus/alerts.yml).
+[`monitoring/prometheus/alerts.yml`](monitoring/prometheus/alerts.yml). The
+Compose stack loads `monitoring/prometheus/prometheus.yml` and provisions a
+Grafana dashboard from `monitoring/grafana/dashboards/`.
 
 ## Database migrations
 
@@ -458,6 +503,8 @@ indexes. `migrations/0002_add_replay_audit.sql` adds the durable
 per-tenant unique names, unique 32-byte SHA-256 digests and revocation
 timestamps. `migrations/0004_add_cancellation.sql` adds `cancel_requested_at`
 and the `(tenant_id, created_at DESC, id DESC)` index used by cursor pagination.
+`migrations/0005_add_job_owner.sql` adds `created_by_api_key_id` and the tenant
+owner index used for owner-scoped job visibility.
 
 ## Tests
 
@@ -508,7 +555,10 @@ The integration suite verifies:
 
 Phase 2–3 claim and concurrency tests run in throwaway PostgreSQL schemas, so
 they do not depend on or disturb development data. Integration tests are skipped
-when no `TEST_DATABASE_URL` or `DATABASE_URL` is set.
+when no `TEST_DATABASE_URL` or `DATABASE_URL` is set. CI starts a PostgreSQL
+service container so the full integration suite runs on every push and pull
+request. The Makefile wraps the common commands as `make test`, `make test-race`
+and `make check`.
 
 ## Project layout
 
@@ -531,7 +581,12 @@ migrations/              Embedded versioned SQL migrations
 tests/integration/       PostgreSQL-backed API and worker tests
 docs/architecture/       Architecture blueprint and diagrams
 docs/monitoring/         Scrape, dashboard, alert and runbook guidance
-monitoring/prometheus/   Starter Prometheus alert rules
+monitoring/prometheus/   Prometheus scrape config and starter alert rules
+monitoring/grafana/      Provisioned datasource and dashboard
+.github/workflows/       CI pipeline
+Dockerfile               Multi-stage images for api, worker, migrate and apikey
+compose.yaml             Full local stack
+Makefile                 Common build, test and stack targets
 ```
 
 ## Roadmap
@@ -545,7 +600,7 @@ monitoring/prometheus/   Starter Prometheus alert rules
 | 5 — Retry, dead-letter and replay | Implemented with Phase 3 |
 | 6 — Authentication and tenant hardening | Implemented: API keys, owner/operator authz, schema validation, listing, cancellation, quotas and separate rate limits |
 | 7 — Observability | Implemented: structured logs, health checks, Prometheus `/metrics`, queue gauges, starter alerts, runbooks and dashboard queries |
-| 8 — Containers and CI | Planned |
+| 8 — Containers and CI | Implemented: multi-stage images, full Compose stack, Makefile targets and GitHub Actions with PostgreSQL integration tests |
 | 9 — AWS and Terraform | Planned |
 | 10 — Kubernetes lab | Planned |
 

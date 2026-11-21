@@ -212,6 +212,9 @@ func Load() (Config, error) {
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive")
 	}
+	if cfg.WebhookAllowPrivateIPs && isProductionEnvironment(cfg.Environment) {
+		return Config{}, fmt.Errorf("WEBHOOK_ALLOW_PRIVATE_IPS must be false when APP_ENV is production")
+	}
 	if cfg.MetricsEnabled {
 		host, _, err := net.SplitHostPort(cfg.MetricsAddr)
 		if err != nil {
@@ -241,6 +244,17 @@ func loopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
+}
+
+// isProductionEnvironment identifies environments where the webhook
+// private-IP escape hatch must never be enabled.
+func isProductionEnvironment(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "production", "prod", "live":
+		return true
+	default:
+		return false
+	}
 }
 
 // envStringList parses a comma-separated environment variable into trimmed,

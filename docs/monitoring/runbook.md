@@ -237,9 +237,10 @@ connections for 10 minutes.
 ```promql
 max(db_pool_in_use / clamp_min(db_pool_max_conns, 1))
 max(db_pool_idle)
-sum(rate(db_pool_wait_count[5m]))
+sum(db_pool_wait_count)
 ```
 
+`db_pool_wait_count` is a cumulative gauge, so do not wrap it in `rate()`.
 `db_pool_max_conns` reflects `DB_MAX_CONNS` **per process**, so total possible
 connections are replicas times that value. Inspect `pg_stat_activity` for idle
 in transactions, long queries, lock waits and connection limits.
