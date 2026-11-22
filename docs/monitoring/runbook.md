@@ -2,6 +2,8 @@
 
 Alert rules live in [`monitoring/prometheus/alerts.yml`](../../monitoring/prometheus/alerts.yml).
 Thresholds are starting points; tune them after a baseline is available.
+For proactive verification of the behaviours these alerts cover, run the
+[failure drills](../runbooks/failure-drills.md).
 
 ## General triage
 
@@ -223,9 +225,10 @@ import.
 
 **Response:** confirm expected load. If legitimate, adjust
 `TENANT_RATE_LIMIT_PER_MINUTE` or `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE`
-deliberately and record the change; limits are in-memory per API process, so all
-replicas should use the same configuration. If abusive, block or throttle the
-client upstream.
+deliberately and record the change. If abusive, block or throttle the client
+upstream. The budgets are in-memory; keep `API_REPLICAS=1` while they are
+enabled, or disable both budgets explicitly before scaling. Startup refuses the
+inconsistent combination.
 
 ## DurableJobDBPoolSaturated
 

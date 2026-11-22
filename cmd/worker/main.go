@@ -37,8 +37,10 @@ func run() error {
 	}
 	metrics := observability.NewMetrics()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
 
 	pool, err := postgres.Connect(ctx, postgres.Config{
 		URL:            cfg.DatabaseURL,
@@ -83,11 +85,10 @@ func run() error {
 		return fmt.Errorf("create worker: %w", err)
 	}
 
+	metricsErr := make(chan error, 1)
 	if cfg.MetricsEnabled {
 		go func() {
-			if err := observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics); err != nil {
-				logger.Error("metrics server stopped", "error", err)
-			}
+			metricsErr <- observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics)
 		}()
 		go observability.PollPoolStats(ctx, 15*time.Second, func() observability.PoolStats {
 			stat := pool.Stat()
@@ -101,7 +102,22 @@ func run() error {
 		logger.Info("metrics endpoint enabled", "addr", cfg.MetricsAddr)
 	}
 
-	return runner.Run(ctx)
+	runnerErr := make(chan error, 1)
+	go func() {
+		runnerErr <- runner.Run(ctx)
+	}()
+
+	select {
+	case err := <-metricsErr:
+		if err != nil {
+			return fmt.Errorf("metrics server: %w", err)
+		}
+		// A clean metrics shutdown happens during signal-driven worker
+		// shutdown; wait for the runner to finish draining.
+		return <-runnerErr
+	case err := <-runnerErr:
+		return err
+	}
 }
 
 // workerID identifies this process in jobs.locked_by.

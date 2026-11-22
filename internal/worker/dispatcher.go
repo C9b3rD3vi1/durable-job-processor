@@ -86,7 +86,7 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 	if !job.CreatedAt.IsZero() && started.After(job.CreatedAt) {
 		r.metrics.Observe(observability.MetricJobWaitDuration, started.Sub(job.CreatedAt).Seconds(), jobType)
 	}
-	result, err := invokeHandler(handlerCtx, handler, *job)
+	result, err := invokeHandlerBounded(handlerCtx, handler, *job)
 	timedOut := errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
 	elapsed := time.Since(started)
 	r.metrics.Observe(observability.MetricJobExecutionDuration, elapsed.Seconds(), jobType)
@@ -242,6 +242,30 @@ func (r *Runner) fail(ctx context.Context, job *domain.Job, logger *slog.Logger,
 		"retry_in", retryDelay.String(),
 	)
 	return true
+}
+
+// handlerOutcome carries a completed handler invocation back to the runner.
+type handlerOutcome struct {
+	result json.RawMessage
+	err    error
+}
+
+// invokeHandlerBounded returns when the context is done even if the handler
+// ignores cancellation. The handler goroutine may outlive the runner, so the
+// result channel is buffered; process exit reclaims any abandoned goroutine.
+func invokeHandlerBounded(ctx context.Context, handler handlers.Handler, job domain.Job) (json.RawMessage, error) {
+	done := make(chan handlerOutcome, 1)
+	go func() {
+		result, err := invokeHandler(ctx, handler, job)
+		done <- handlerOutcome{result: result, err: err}
+	}()
+
+	select {
+	case outcome := <-done:
+		return outcome.result, outcome.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // invokeHandler isolates the runner from handler panics.

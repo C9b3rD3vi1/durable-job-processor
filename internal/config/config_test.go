@@ -121,6 +121,30 @@ func TestLoadRejectsNegativeRateLimits(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsMultipleAPIReplicasWithRateLimits(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("API_REPLICAS", "2")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want multi-replica rate limit constraint")
+	}
+}
+
+func TestLoadAllowsMultipleAPIReplicasWhenRateLimitsDisabled(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("API_REPLICAS", "3")
+	t.Setenv("TENANT_RATE_LIMIT_PER_MINUTE", "0")
+	t.Setenv("TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE", "0")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.APIReplicas != 3 {
+		t.Errorf("APIReplicas = %d, want 3", cfg.APIReplicas)
+	}
+}
+
 func TestLoadFromPort(t *testing.T) {
 	setBaseEnv(t)
 	t.Setenv("HTTP_ADDR", "")

@@ -91,9 +91,10 @@ phases.
   returns `429` with `Retry-After` when a tenant exceeds its budget. Job
   submissions also carry a separate, tighter per-tenant budget so submission
   bursts cannot spend the general request allowance. These budgets are in-memory
-  per API process; the local stack deliberately runs one API replica. Multiple
-  replicas need a shared limiter before the effective per-tenant budget remains
-  accurate.
+  per API process. `API_REPLICAS` defaults to `1`; startup fails if it is greater
+  than `1` while either budget is enabled, so the constraint is explicit rather
+  than silent. Scaling the API requires a shared limiter, or both budgets must
+  be deliberately disabled.
 
 Job payloads are deliberately omitted from API responses to avoid exposing
 sensitive data. Lease fields and idempotency keys are internal.
@@ -140,6 +141,22 @@ curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/health/ready
 ```
 
 Use `make down` to stop the stack. Data is kept in named Docker volumes.
+
+### Published container images
+
+Pushes to `main` build and publish four images to GitHub Container Registry:
+
+```text
+ghcr.io/<owner>/durable-job-processor-api:latest
+ghcr.io/<owner>/durable-job-processor-worker:latest
+ghcr.io/<owner>/durable-job-processor-migrate:latest
+ghcr.io/<owner>/durable-job-processor-apikey:latest
+```
+
+`<owner>` and the repository path are lowercased because GHCR requires lowercase
+image names. Each push also receives immutable `main` and full commit-SHA tags.
+Pull requests build every target but never publish or authenticate to the
+registry.
 
 ## Local Go development
 
@@ -423,6 +440,7 @@ records a retry for work that could not finish.
 | `TENANT_MAX_OUTSTANDING_JOBS` | `1000` | Queued, running and retry-wait jobs per tenant; `0` disables |
 | `TENANT_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant API requests per fixed minute; `0` disables |
 | `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE` | `120` | Per-tenant `POST /v1/jobs` requests per fixed minute, in addition to the general limit; `0` disables |
+| `API_REPLICAS` | `1` | Declared API replica count; startup fails above `1` while in-memory rate limits are enabled |
 | `WEBHOOK_ALLOWED_HOSTS` | empty | Optional comma-separated webhook destination allow-list; a leading `.` permits subdomains |
 | `WEBHOOK_ALLOW_PRIVATE_IPS` | `false` | Allows loopback/private/link-local webhook destinations for local tests only |
 | `METRICS_ENABLED` | `true` | Serve Prometheus metrics from a dedicated listener in the API and worker |
@@ -558,7 +576,8 @@ they do not depend on or disturb development data. Integration tests are skipped
 when no `TEST_DATABASE_URL` or `DATABASE_URL` is set. CI starts a PostgreSQL
 service container so the full integration suite runs on every push and pull
 request. The Makefile wraps the common commands as `make test`, `make test-race`
-and `make check`.
+and `make check`. Operational verification procedures are in
+[`docs/runbooks/failure-drills.md`](docs/runbooks/failure-drills.md).
 
 ## Project layout
 
@@ -581,6 +600,7 @@ migrations/              Embedded versioned SQL migrations
 tests/integration/       PostgreSQL-backed API and worker tests
 docs/architecture/       Architecture blueprint and diagrams
 docs/monitoring/         Scrape, dashboard, alert and runbook guidance
+docs/runbooks/           Failure drills for local and operational verification
 monitoring/prometheus/   Prometheus scrape config and starter alert rules
 monitoring/grafana/      Provisioned datasource and dashboard
 .github/workflows/       CI pipeline

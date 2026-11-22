@@ -9,7 +9,8 @@ import (
 // Run starts the configured number of claim loops and blocks until ctx is
 // cancelled. Loops stop claiming immediately; in-flight handlers may finish for
 // up to ShutdownTimeout. After that their contexts are cancelled and the runner
-// waits for them to record a retry or terminal failure.
+// waits one final bounded grace period for fenced persistence writes. Handlers
+// that ignore cancellation are abandoned rather than blocking shutdown.
 func (r *Runner) Run(ctx context.Context) error {
 	// Handler contexts deliberately outlive the signal context so a graceful
 	// shutdown can drain work already in progress.
@@ -71,8 +72,21 @@ func (r *Runner) Run(ctx context.Context) error {
 			"worker_id", r.workerID,
 		)
 		cancelHandlers()
-		<-drained
-		r.logger.Info("worker stopped after forced cancellation", "worker_id", r.workerID)
+
+		// Give fenced persistence writes a bounded final grace period. A
+		// handler that ignores cancellation has already been abandoned by
+		// invokeHandlerBounded, so waiting forever would serve no purpose.
+		finalTimer := time.NewTimer(persistTimeout)
+		defer finalTimer.Stop()
+		select {
+		case <-drained:
+			r.logger.Info("worker stopped after forced cancellation", "worker_id", r.workerID)
+		case <-finalTimer.C:
+			r.logger.Warn("worker shutdown grace exceeded; abandoning in-flight handlers",
+				"worker_id", r.workerID,
+				"grace", persistTimeout.String(),
+			)
+		}
 		return nil
 	}
 }

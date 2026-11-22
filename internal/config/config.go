@@ -29,6 +29,7 @@ const (
 	defaultTenantMaxOutstandingJobs       = 1000
 	defaultTenantRateLimitPerMinute       = 600
 	defaultTenantSubmitRateLimitPerMinute = 120
+	defaultAPIReplicas                    = 1
 	defaultMetricsAddr                    = "127.0.0.1:9090"
 )
 
@@ -61,6 +62,10 @@ type Config struct {
 	TenantMaxOutstandingJobs       int
 	TenantRateLimitPerMinute       int
 	TenantSubmitRateLimitPerMinute int
+
+	// APIReplicas records how many API processes share the in-memory rate
+	// limiter. Scaling beyond one requires a shared limiter implementation.
+	APIReplicas int
 
 	// Webhook egress controls. AllowedHosts is an optional allow-list; an empty
 	// list permits any public host. AllowPrivateIPs is for local development
@@ -147,6 +152,9 @@ func Load() (Config, error) {
 	if cfg.TenantSubmitRateLimitPerMinute, err = envInt("TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE", defaultTenantSubmitRateLimitPerMinute); err != nil {
 		return Config{}, err
 	}
+	if cfg.APIReplicas, err = envInt("API_REPLICAS", defaultAPIReplicas); err != nil {
+		return Config{}, err
+	}
 	cfg.MaxPayloadBytes, err = envInt64("MAX_PAYLOAD_BYTES", defaultMaxPayloadBytes)
 	if err != nil {
 		return Config{}, err
@@ -208,6 +216,13 @@ func Load() (Config, error) {
 	}
 	if cfg.TenantSubmitRateLimitPerMinute < 0 {
 		return Config{}, fmt.Errorf("TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE must not be negative")
+	}
+	if cfg.APIReplicas < 1 {
+		return Config{}, fmt.Errorf("API_REPLICAS must be at least 1")
+	}
+	if cfg.APIReplicas > 1 &&
+		(cfg.TenantRateLimitPerMinute > 0 || cfg.TenantSubmitRateLimitPerMinute > 0) {
+		return Config{}, fmt.Errorf("in-memory rate limits require API_REPLICAS=1; use a shared limiter before scaling API replicas")
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive")

@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -135,6 +136,18 @@ func TestServeMetricsRejectsUnauthenticatedPublicBinding(t *testing.T) {
 	}
 	if err := ServeMetrics(context.Background(), "not-an-address", "token", NewMetrics()); err == nil {
 		t.Fatal("ServeMetrics() error = nil, want invalid address error")
+	}
+}
+
+func TestServeMetricsReturnsBindError(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	defer listener.Close()
+
+	if err := ServeMetrics(context.Background(), listener.Addr().String(), "", NewMetrics()); err == nil {
+		t.Fatal("ServeMetrics() error = nil, want bind conflict error")
 	}
 }
 

@@ -54,6 +54,7 @@ func run() error {
 	}
 	defer pool.Close()
 	logger.Info("database connected", "max_conns", cfg.DBMaxConns)
+	logger.Info("rate limiter configured", "backend", "memory", "api_replicas", cfg.APIReplicas)
 
 	if cfg.AutoMigrate {
 		applied, err := postgres.Migrate(ctx, pool, migrations.FS)
@@ -94,11 +95,10 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	metricsErr := make(chan error, 1)
 	if cfg.MetricsEnabled {
 		go func() {
-			if err := observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics); err != nil {
-				logger.Error("metrics server stopped", "error", err)
-			}
+			metricsErr <- observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics)
 		}()
 		go observability.PollPoolStats(ctx, 15*time.Second, func() observability.PoolStats {
 			stat := pool.Stat()
@@ -128,6 +128,8 @@ func run() error {
 			return nil
 		}
 		return fmt.Errorf("serve HTTP: %w", err)
+	case err := <-metricsErr:
+		return fmt.Errorf("metrics server: %w", err)
 	case <-ctx.Done():
 		logger.Info("shutdown requested", "timeout", cfg.ShutdownTimeout.String())
 	}
@@ -140,6 +142,11 @@ func run() error {
 
 	if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serve HTTP: %w", err)
+	}
+	if cfg.MetricsEnabled {
+		if err := <-metricsErr; err != nil {
+			return fmt.Errorf("metrics server: %w", err)
+		}
 	}
 	logger.Info("api stopped")
 	return nil
