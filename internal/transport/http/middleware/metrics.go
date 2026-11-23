@@ -44,14 +44,17 @@ func HTTPMetrics(metrics *observability.Metrics) func(http.Handler) http.Handler
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			started := time.Now()
 			recorder := &metricsStatusRecorder{ResponseWriter: w, status: http.StatusOK}
+			// Record with defer so a recovered panic is counted as a 500 even if
+			// an inner recoverer writes the response before returning.
+			defer func() {
+				route := routeLabel(r.URL.Path)
+				methodLabels := []observability.Label{observability.L("method", r.Method), observability.L("route", route)}
+				metrics.Inc(observability.MetricHTTPRequestsTotal,
+					append(methodLabels, observability.L("status", strconv.Itoa(recorder.status)))...,
+				)
+				metrics.Observe(observability.MetricHTTPRequestDuration, time.Since(started).Seconds(), methodLabels...)
+			}()
 			next.ServeHTTP(recorder, r)
-
-			route := routeLabel(r.URL.Path)
-			methodLabels := []observability.Label{observability.L("method", r.Method), observability.L("route", route)}
-			metrics.Inc(observability.MetricHTTPRequestsTotal,
-				append(methodLabels, observability.L("status", strconv.Itoa(recorder.status)))...,
-			)
-			metrics.Observe(observability.MetricHTTPRequestDuration, time.Since(started).Seconds(), methodLabels...)
 		})
 	}
 }

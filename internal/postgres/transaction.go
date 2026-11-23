@@ -15,14 +15,19 @@ func WithTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) (err
 	if err != nil {
 		return err
 	}
+	committed := false
 	defer func() {
-		if err != nil {
-			_ = tx.Rollback(ctx)
+		if !committed {
+			// Use a context that is not tied to the caller's cancellation so a
+			// panic or a cancelled request still rolls back the transaction.
+			_ = tx.Rollback(context.WithoutCancel(ctx))
 		}
 	}()
 
 	if err = fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	err = tx.Commit(ctx)
+	committed = err == nil
+	return err
 }

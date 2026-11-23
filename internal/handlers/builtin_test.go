@@ -281,3 +281,63 @@ func TestWebhookDeliverHandlerTimeout(t *testing.T) {
 		t.Errorf("classification = %v, want transient", class)
 	}
 }
+
+func TestWebhookClientAppliesDefaultTimeout(t *testing.T) {
+	client := newWebhookHTTPClient(WebhookEgressPolicy{}, &http.Client{}, nil)
+	if client.Timeout != webhookTimeout {
+		t.Errorf("default timeout = %v, want %v", client.Timeout, webhookTimeout)
+	}
+
+	custom := 50 * time.Millisecond
+	client = newWebhookHTTPClient(WebhookEgressPolicy{}, &http.Client{Timeout: custom}, nil)
+	if client.Timeout != custom {
+		t.Errorf("custom timeout = %v, want %v", client.Timeout, custom)
+	}
+}
+
+func TestWebhookHeadersAreNormalizedAndDeduplicated(t *testing.T) {
+	var gotHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Webhook-Event")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	payload := `{"url":"` + server.URL + `","headers":{" X-WEBHOOK-EVENT ":"created"}}`
+	handler := localWebhookHandler()
+	if err := handler.ValidatePayload([]byte(payload)); err != nil {
+		t.Fatalf("ValidatePayload() error = %v, want mixed-case header accepted", err)
+	}
+	if _, err := handler.Execute(context.Background(), testJob("webhook.deliver", payload)); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if gotHeader != "created" {
+		t.Errorf("X-Webhook-Event = %q, want created", gotHeader)
+	}
+
+	duplicate := `{"url":"` + server.URL + `","headers":{"X-Webhook-Event":"a","x-webhook-event":"b"}}`
+	err := handler.ValidatePayload([]byte(duplicate))
+	if err == nil || !strings.Contains(err.Error(), "duplicated after normalization") {
+		t.Fatalf("ValidatePayload() error = %v, want duplicate normalized header rejected", err)
+	}
+}
+
+func TestWebhookDeliverHandlerRetryableClientStatuses(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			_, err := localWebhookHandler().Execute(context.Background(), testJob("webhook.deliver",
+				`{"url":"`+server.URL+`"}`))
+			if err == nil {
+				t.Fatal("Execute() error = nil, want failure")
+			}
+			if class := retry.Classify(err); class != retry.ClassTransient {
+				t.Errorf("classification = %v, want transient for HTTP %d", class, status)
+			}
+		})
+	}
+}

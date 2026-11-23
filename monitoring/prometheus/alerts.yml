@@ -93,6 +93,30 @@ groups:
             for 5 minutes. Check the listener, network policy and bearer token.
           runbook_url: docs/monitoring/runbook.md#durablejobmetricsunavailable
 
+      - alert: DurableJobAPIMetricsTargetAbsent
+        expr: absent(up{job="durable-job-api"}) == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: API metrics target is absent
+          description: >-
+            Prometheus has no durable-job-api target in its discovery output for
+            5 minutes. Check the scrape configuration and deployment discovery.
+          runbook_url: docs/monitoring/runbook.md#durablejobapimetricstargetabsent
+
+      - alert: DurableJobWorkerMetricsTargetAbsent
+        expr: absent(up{job="durable-job-worker"}) == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Worker metrics target is absent
+          description: >-
+            Prometheus has no durable-job-worker target in its discovery output
+            for 5 minutes. Check the scrape configuration and deployment discovery.
+          runbook_url: docs/monitoring/runbook.md#durablejobworkermetricstargetabsent
+
       - alert: DurableJobRateLimitSpike
         expr: sum(increase(api_rate_limited_total[15m])) > 100
         for: 10m

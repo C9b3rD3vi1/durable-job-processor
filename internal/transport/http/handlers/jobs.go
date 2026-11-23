@@ -148,6 +148,10 @@ func (h *JobsHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
 
 	if raw := strings.TrimSpace(query.Get("status")); raw != "" {
 		status := domain.JobStatus(raw)
+		if !status.Valid() {
+			writeError(w, http.StatusBadRequest, "invalid_query", "status must be a known job status")
+			return
+		}
 		in.Status = &status
 	}
 
@@ -160,10 +164,19 @@ func (h *JobsHandler) ListJobs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
 	}
+	if in.CreatedAfter != nil && in.CreatedBefore != nil && in.CreatedAfter.After(*in.CreatedBefore) {
+		writeError(w, http.StatusBadRequest, "invalid_query", "created_after must not be later than created_before")
+		return
+	}
 	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
 		limit, convErr := strconv.Atoi(raw)
 		if convErr != nil {
 			writeError(w, http.StatusBadRequest, "invalid_query", "limit must be an integer")
+			return
+		}
+		if limit < 1 || limit > jobs.MaxListLimit {
+			writeError(w, http.StatusBadRequest, "invalid_query",
+				fmt.Sprintf("limit must be between 1 and %d", jobs.MaxListLimit))
 			return
 		}
 		in.Limit = limit

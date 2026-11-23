@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -101,5 +102,34 @@ func TestRateLimitWithMetricsCountsRejections(t *testing.T) {
 	}
 	if !strings.Contains(exposition(t, metrics), `api_rate_limited_total{scope="submission"} 1`) {
 		t.Error("rate limit rejection was not counted")
+	}
+}
+
+func TestRateLimitStoreErrorIsCountedAsUnavailable(t *testing.T) {
+	metrics := observability.NewMetrics()
+	store := &fakeRateLimitStore{
+		allow: func(context.Context, string, uuid.UUID, int, time.Duration) (bool, time.Duration, error) {
+			return false, 0, errors.New("database unavailable")
+		},
+	}
+	limiter := NewStoreRateLimiter(store, "request", 5, time.Minute)
+	handler := RateLimitWithMetrics(limiter, nil, metrics)(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+	req = req.WithContext(context.WithValue(req.Context(), identityContextKey{},
+		auth.Identity{TenantID: uuid.New()}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := exposition(t, metrics)
+	if !strings.Contains(body, `api_rate_limiter_unavailable_total{scope="request"} 1`) {
+		t.Errorf("unavailable store error was not counted\n%s", body)
+	}
+	if strings.Contains(body, `api_rate_limited_total{scope="request"}`) {
+		t.Error("store error was incorrectly counted as a rate limit rejection")
 	}
 }

@@ -20,28 +20,29 @@ import (
 // Metric names exported by the API and worker. Names ending in _total are
 // counters; _seconds are histograms in seconds; gauges are instantaneous.
 const (
-	MetricHTTPRequestsTotal    = "api_http_requests_total"
-	MetricHTTPRequestDuration  = "api_http_request_duration_seconds"
-	MetricRateLimitedTotal     = "api_rate_limited_total"
-	MetricJobsSubmittedTotal   = "jobs_submitted_total"
-	MetricJobsCompletedTotal   = "jobs_completed_total"
-	MetricJobsFailedTotal      = "jobs_failed_total"
-	MetricJobsRetriedTotal     = "jobs_retried_total"
-	MetricJobsDeadTotal        = "jobs_dead_lettered_total"
-	MetricJobsReplayedTotal    = "jobs_replayed_total"
-	MetricJobsCancelledTotal   = "jobs_cancelled_total"
-	MetricJobAttemptsTotal     = "job_attempts_total"
-	MetricJobWaitDuration      = "job_wait_duration_seconds"
-	MetricJobExecutionDuration = "job_execution_duration_seconds"
-	MetricWorkerActive         = "worker_active_count"
-	MetricHeartbeatFailures    = "worker_heartbeat_failures_total"
-	MetricExpiredLeases        = "worker_expired_leases_total"
-	MetricQueueDepth           = "jobs_queue_depth"
-	MetricQueueOldestDue       = "jobs_oldest_due_seconds"
-	MetricDBPoolInUse          = "db_pool_in_use"
-	MetricDBPoolIdle           = "db_pool_idle"
-	MetricDBPoolWaitCount      = "db_pool_wait_count"
-	MetricDBPoolMaxConns       = "db_pool_max_conns"
+	MetricHTTPRequestsTotal           = "api_http_requests_total"
+	MetricHTTPRequestDuration         = "api_http_request_duration_seconds"
+	MetricRateLimitedTotal            = "api_rate_limited_total"
+	MetricRateLimiterUnavailableTotal = "api_rate_limiter_unavailable_total"
+	MetricJobsSubmittedTotal          = "jobs_submitted_total"
+	MetricJobsCompletedTotal          = "jobs_completed_total"
+	MetricJobsFailedTotal             = "jobs_failed_total"
+	MetricJobsRetriedTotal            = "jobs_retried_total"
+	MetricJobsDeadTotal               = "jobs_dead_lettered_total"
+	MetricJobsReplayedTotal           = "jobs_replayed_total"
+	MetricJobsCancelledTotal          = "jobs_cancelled_total"
+	MetricJobAttemptsTotal            = "job_attempts_total"
+	MetricJobWaitDuration             = "job_wait_duration_seconds"
+	MetricJobExecutionDuration        = "job_execution_duration_seconds"
+	MetricWorkerActive                = "worker_active_count"
+	MetricHeartbeatFailures           = "worker_heartbeat_failures_total"
+	MetricExpiredLeases               = "worker_expired_leases_total"
+	MetricQueueDepth                  = "jobs_queue_depth"
+	MetricQueueOldestDue              = "jobs_oldest_due_seconds"
+	MetricDBPoolInUse                 = "db_pool_in_use"
+	MetricDBPoolIdle                  = "db_pool_idle"
+	MetricDBPoolWaitCount             = "db_pool_wait_count"
+	MetricDBPoolMaxConns              = "db_pool_max_conns"
 )
 
 // Label is a single Prometheus label. Use L to build labels at call sites.
@@ -74,28 +75,29 @@ var (
 	waitBuckets     = []float64{0.1, 0.5, 1, 5, 15, 60, 300, 900, 3600}
 
 	definitions = map[string]metricDef{
-		MetricHTTPRequestsTotal:    {kind: kindCounter, help: "HTTP requests handled by the API."},
-		MetricHTTPRequestDuration:  {kind: kindHistogram, help: "HTTP request duration in seconds.", bounds: durationBuckets},
-		MetricRateLimitedTotal:     {kind: kindCounter, help: "Requests rejected by a tenant rate limit."},
-		MetricJobsSubmittedTotal:   {kind: kindCounter, help: "Job submissions, by result (created, replayed, rejected, error)."},
-		MetricJobsCompletedTotal:   {kind: kindCounter, help: "Jobs completed successfully."},
-		MetricJobsFailedTotal:      {kind: kindCounter, help: "Handler failures durably persisted."},
-		MetricJobsRetriedTotal:     {kind: kindCounter, help: "Failures that scheduled another attempt."},
-		MetricJobsDeadTotal:        {kind: kindCounter, help: "Jobs moved to the dead state."},
-		MetricJobsReplayedTotal:    {kind: kindCounter, help: "Dead jobs replayed by an operator."},
-		MetricJobsCancelledTotal:   {kind: kindCounter, help: "Jobs cancelled by a client or operator."},
-		MetricJobAttemptsTotal:     {kind: kindCounter, help: "Job execution attempts started by a worker."},
-		MetricJobWaitDuration:      {kind: kindHistogram, help: "Time between job creation and execution in seconds.", bounds: waitBuckets},
-		MetricJobExecutionDuration: {kind: kindHistogram, help: "Handler execution duration in seconds.", bounds: durationBuckets},
-		MetricWorkerActive:         {kind: kindGauge, help: "Handlers currently executing in this process."},
-		MetricHeartbeatFailures:    {kind: kindCounter, help: "Lease heartbeat errors."},
-		MetricExpiredLeases:        {kind: kindCounter, help: "Expired leases resolved by recovery."},
-		MetricQueueDepth:           {kind: kindGauge, help: "Jobs ready to claim across the whole queue."},
-		MetricQueueOldestDue:       {kind: kindGauge, help: "Age in seconds of the oldest due job."},
-		MetricDBPoolInUse:          {kind: kindGauge, help: "Database connections currently acquired."},
-		MetricDBPoolIdle:           {kind: kindGauge, help: "Idle database connections."},
-		MetricDBPoolWaitCount:      {kind: kindGauge, help: "Cumulative waiters for a database connection."},
-		MetricDBPoolMaxConns:       {kind: kindGauge, help: "Configured maximum database connections."},
+		MetricHTTPRequestsTotal:           {kind: kindCounter, help: "HTTP requests handled by the API."},
+		MetricHTTPRequestDuration:         {kind: kindHistogram, help: "HTTP request duration in seconds.", bounds: durationBuckets},
+		MetricRateLimitedTotal:            {kind: kindCounter, help: "Requests rejected by a tenant rate limit."},
+		MetricRateLimiterUnavailableTotal: {kind: kindCounter, help: "Requests rejected because the shared rate limit store was unavailable."},
+		MetricJobsSubmittedTotal:          {kind: kindCounter, help: "Job submissions, by result (created, replayed, rejected, error)."},
+		MetricJobsCompletedTotal:          {kind: kindCounter, help: "Jobs completed successfully."},
+		MetricJobsFailedTotal:             {kind: kindCounter, help: "Handler failures durably persisted."},
+		MetricJobsRetriedTotal:            {kind: kindCounter, help: "Failures that scheduled another attempt."},
+		MetricJobsDeadTotal:               {kind: kindCounter, help: "Jobs moved to the dead state."},
+		MetricJobsReplayedTotal:           {kind: kindCounter, help: "Dead jobs replayed by an operator."},
+		MetricJobsCancelledTotal:          {kind: kindCounter, help: "Jobs cancelled by a client or operator."},
+		MetricJobAttemptsTotal:            {kind: kindCounter, help: "Job execution attempts started by a worker."},
+		MetricJobWaitDuration:             {kind: kindHistogram, help: "Time between job creation and execution in seconds.", bounds: waitBuckets},
+		MetricJobExecutionDuration:        {kind: kindHistogram, help: "Handler execution duration in seconds.", bounds: durationBuckets},
+		MetricWorkerActive:                {kind: kindGauge, help: "Handlers currently executing in this process."},
+		MetricHeartbeatFailures:           {kind: kindCounter, help: "Lease heartbeat errors."},
+		MetricExpiredLeases:               {kind: kindCounter, help: "Expired leases resolved by recovery."},
+		MetricQueueDepth:                  {kind: kindGauge, help: "Jobs ready to claim across the whole queue."},
+		MetricQueueOldestDue:              {kind: kindGauge, help: "Age in seconds of the oldest due job."},
+		MetricDBPoolInUse:                 {kind: kindGauge, help: "Database connections currently acquired."},
+		MetricDBPoolIdle:                  {kind: kindGauge, help: "Idle database connections."},
+		MetricDBPoolWaitCount:             {kind: kindGauge, help: "Cumulative waiters for a database connection."},
+		MetricDBPoolMaxConns:              {kind: kindGauge, help: "Configured maximum database connections."},
 	}
 )
 

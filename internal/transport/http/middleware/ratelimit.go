@@ -178,6 +178,8 @@ func RateLimitWithMetrics(limiter Limiter, logger *slog.Logger, metrics *observa
 
 			allowed, retryAfter, err := limiter.AllowContext(r.Context(), identity.TenantID)
 			if err != nil {
+				metrics.Inc(observability.MetricRateLimiterUnavailableTotal,
+					observability.L("scope", label))
 				if logger != nil {
 					logger.Error("rate limit check failed",
 						"tenant_id", identity.TenantID,

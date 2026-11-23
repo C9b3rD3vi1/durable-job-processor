@@ -177,11 +177,12 @@ func (r *JobRepository) FailJob(ctx context.Context, id, leaseToken uuid.UUID, c
 	return tag.RowsAffected() == 1, nil
 }
 
-// HeartbeatJob renews the lease only while the caller still holds it. A zero
-// rows-affected result is the fencing signal that the worker has lost
-// ownership and must stop state changes for this attempt. The renewal also
-// reports a durable cooperative cancellation request so the worker can stop the
-// handler without waiting for its lease to expire.
+// HeartbeatJob renews the lease only while the caller still holds an unexpired
+// lease. A zero rows-affected result is the fencing signal that the worker has
+// lost ownership and must stop state changes for this attempt. The guard also
+// prevents a stale worker from renewing a lease after recovery has begun. The
+// renewal reports a durable cooperative cancellation request so the worker can
+// stop the handler without waiting for its lease to expire.
 func (r *JobRepository) HeartbeatJob(ctx context.Context, id, leaseToken uuid.UUID, leaseDuration time.Duration) (queue.HeartbeatResult, error) {
 	if id == uuid.Nil || leaseToken == uuid.Nil {
 		return queue.HeartbeatResult{}, fmt.Errorf("%w: job id and lease token are required", domain.ErrInvalidArgument)
@@ -198,6 +199,7 @@ func (r *JobRepository) HeartbeatJob(ctx context.Context, id, leaseToken uuid.UU
 		WHERE id = $2
 		  AND status = 'running'
 		  AND lease_token = $3
+		  AND locked_until >= now()
 		RETURNING cancel_requested_at IS NOT NULL`
 
 	var cancelRequested bool

@@ -113,11 +113,11 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 	}
 
 	if err == nil && timedOut {
-		err = fmt.Errorf("handler timed out after %s", r.handlerTimeout)
+		err = timeoutError(r.handlerTimeout, nil)
 	}
 	if err != nil {
 		if timedOut {
-			err = fmt.Errorf("handler timed out after %s: %w", r.handlerTimeout, context.DeadlineExceeded)
+			err = timeoutError(r.handlerTimeout, err)
 		}
 		retryDelay := time.Duration(0)
 		if retry.ShouldRetry(retry.Classify(err), job.Attempts, job.MaxAttempts) {
@@ -149,6 +149,17 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 	}
 	r.metrics.Inc(observability.MetricJobsCompletedTotal, jobType)
 	logger.Info("job succeeded", "duration", elapsed.String())
+}
+
+// timeoutError wraps a timed-out handler error while preserving an explicit
+// retry classification. DeadlineExceeded is joined as the fallback signal when
+// the handler did not classify its own failure.
+func timeoutError(timeout time.Duration, cause error) error {
+	if cause == nil {
+		return fmt.Errorf("handler timed out after %s: %w", timeout, context.DeadlineExceeded)
+	}
+	return fmt.Errorf("handler timed out after %s: %w",
+		timeout, errors.Join(cause, context.DeadlineExceeded))
 }
 
 // heartbeat renews the lease until the handler finishes or ownership is lost.
@@ -207,6 +218,7 @@ func (r *Runner) cancelledAfterWrite(ctx context.Context, job *domain.Job, logge
 	if !cancelled {
 		return false
 	}
+	r.metrics.Inc(observability.MetricJobsCancelledTotal, observability.L("job_type", job.JobType))
 	logger.Info("job cancelled")
 	return true
 }

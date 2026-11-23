@@ -28,20 +28,23 @@ func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: w}
+			// Log with defer so a recovered panic still produces an HTTP request
+			// log line with the final 500 status.
+			defer func() {
+				status := rec.status
+				if status == 0 {
+					status = http.StatusOK
+				}
+				logger.Info("http request",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"status", status,
+					"duration_ms", time.Since(start).Milliseconds(),
+					"remote_addr", r.RemoteAddr,
+					"response_bytes", rec.bytes,
+				)
+			}()
 			next.ServeHTTP(rec, r)
-
-			status := rec.status
-			if status == 0 {
-				status = http.StatusOK
-			}
-			logger.Info("http request",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", status,
-				"duration_ms", time.Since(start).Milliseconds(),
-				"remote_addr", r.RemoteAddr,
-				"response_bytes", rec.bytes,
-			)
 		})
 	}
 }

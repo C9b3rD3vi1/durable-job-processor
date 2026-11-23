@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -330,5 +331,69 @@ func TestLoadRejectsUnauthenticatedPublicMetrics(t *testing.T) {
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("Load() error = nil, want public metrics endpoint rejected")
+	}
+}
+
+func TestLoadRejectsInvalidListenAddresses(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"http missing port", "HTTP_ADDR", "localhost"},
+		{"http non-numeric port", "HTTP_ADDR", "localhost:http"},
+		{"http zero port", "HTTP_ADDR", ":0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv(tt.key, tt.value)
+
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil, want invalid %s=%q rejected", tt.key, tt.value)
+			}
+		})
+	}
+
+	t.Run("metrics missing port", func(t *testing.T) {
+		setBaseEnv(t)
+		t.Setenv("METRICS_ADDR", "127.0.0.1")
+		t.Setenv("METRICS_TOKEN", "scrape-secret")
+
+		if _, err := config.Load(); err == nil {
+			t.Fatal("Load() error = nil, want invalid METRICS_ADDR rejected")
+		}
+	})
+}
+
+func TestLoadRejectsNonPositiveDBConnectTimeout(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DB_CONNECT_TIMEOUT", "0s")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want non-positive DB_CONNECT_TIMEOUT rejected")
+	}
+}
+
+func TestLoadRejectsRetryMaxDelayBelowBase(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("RETRY_BASE_DELAY", "4s")
+	t.Setenv("RETRY_MAX_DELAY", "1s")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want RETRY_MAX_DELAY below RETRY_BASE_DELAY rejected")
+	}
+}
+
+func TestRequestBodyLimitDoesNotOverflow(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("MAX_PAYLOAD_BYTES", "9223372036854775807")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.RequestBodyLimit(); got != math.MaxInt64 {
+		t.Errorf("RequestBodyLimit() = %d, want MaxInt64", got)
 	}
 }

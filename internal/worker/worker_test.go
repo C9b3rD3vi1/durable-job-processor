@@ -1,11 +1,14 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +16,7 @@ import (
 
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/handlers"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/queue"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/retry"
 	"github.com/google/uuid"
@@ -120,10 +124,10 @@ func (s *fakeStore) HeartbeatJob(_ context.Context, _, _ uuid.UUID, _ time.Durat
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.heartbeatCalls++
 	if s.heartbeatErr != nil {
 		return queue.HeartbeatResult{}, s.heartbeatErr
 	}
-	s.heartbeatCalls++
 	if !s.heartbeatOK {
 		return queue.HeartbeatResult{Renewed: false}, nil
 	}
@@ -475,6 +479,7 @@ func TestProcessStopsWhenLeaseIsLost(t *testing.T) {
 func TestProcessHonorsCancellationRequest(t *testing.T) {
 	store := newFakeStore()
 	store.heartbeatCancel = true
+	metrics := observability.NewMetrics()
 
 	started := make(chan struct{})
 	registry := registryWith(t, "test.cancel", handlers.HandlerFunc(func(ctx context.Context, _ domain.Job) (json.RawMessage, error) {
@@ -486,6 +491,7 @@ func TestProcessHonorsCancellationRequest(t *testing.T) {
 		cfg.LeaseDuration = time.Second
 		cfg.HeartbeatInterval = 5 * time.Millisecond
 		cfg.HandlerTimeout = 2 * time.Second
+		cfg.Metrics = metrics
 	})
 
 	done := make(chan struct{})
@@ -510,6 +516,12 @@ func TestProcessHonorsCancellationRequest(t *testing.T) {
 	}
 	if store.completedCount() != 0 || store.failedCount() != 0 {
 		t.Error("a cancelled job was recorded as completed or failed")
+	}
+
+	recorder := httptest.NewRecorder()
+	metrics.Handler("").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(recorder.Body.String(), `jobs_cancelled_total{job_type="test.cancel"} 1`) {
+		t.Errorf("cancellation metric missing:\n%s", recorder.Body.String())
 	}
 }
 
@@ -701,7 +713,9 @@ func TestProcessHandlerTimeout(t *testing.T) {
 	}))
 	runner := newRunner(t, store, registry, func(cfg *Config) {
 		cfg.HandlerTimeout = 20 * time.Millisecond
+		cfg.RetryBaseDelay = 2 * time.Second
 	})
+	runner.jitter = func() float64 { return 1 }
 	job := testJob("test.slow", 1, 3)
 
 	runner.process(context.Background(), job)
@@ -712,6 +726,27 @@ func TestProcessHandlerTimeout(t *testing.T) {
 	}
 	if record.cause == "" || !strings.Contains(record.cause, "timed out") {
 		t.Errorf("cause = %q, want timeout message", record.cause)
+	}
+	if record.delay != 2*time.Second {
+		t.Errorf("retry delay = %v, want transient retry delay 2s", record.delay)
+	}
+}
+
+func TestTimeoutErrorPreservesExplicitClassification(t *testing.T) {
+	cause := retry.Permanent(errors.New("permanent timeout"))
+	err := timeoutError(20*time.Millisecond, cause)
+
+	if !strings.Contains(err.Error(), "permanent timeout") {
+		t.Errorf("error = %q, want the handler's classified error", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want DeadlineExceeded as the fallback signal", err)
+	}
+	if class := retry.Classify(err); class != retry.ClassPermanent {
+		t.Errorf("classification = %v, want permanent", class)
+	}
+	if retry.ShouldRetry(retry.Classify(err), 1, 3) {
+		t.Error("permanent timeout was treated as retryable")
 	}
 }
 
@@ -742,6 +777,115 @@ func TestProcessFailureIsFenced(t *testing.T) {
 
 	if store.failedCount() != 0 {
 		t.Error("fenced failure was recorded")
+	}
+}
+
+func TestProcessCompletionStoreErrorIsObserved(t *testing.T) {
+	store := newFakeStore()
+	store.completeErr = errors.New("database unavailable")
+	var logs bytes.Buffer
+	registry := registryWith(t, "test.ok", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		return json.RawMessage(`{"ok":true}`), nil
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	})
+
+	runner.process(context.Background(), testJob("test.ok", 1, 3))
+
+	if store.completedCount() != 0 || store.failedCount() != 0 {
+		t.Error("a completion store error wrote job state")
+	}
+	if !strings.Contains(logs.String(), "complete job") {
+		t.Errorf("completion error was not logged:\n%s", logs.String())
+	}
+}
+
+func TestProcessFailureStoreErrorIsObserved(t *testing.T) {
+	store := newFakeStore()
+	store.failErr = errors.New("database unavailable")
+	var logs bytes.Buffer
+	registry := registryWith(t, "test.fail", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		return nil, errors.New("handler failed")
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	})
+
+	runner.process(context.Background(), testJob("test.fail", 1, 3))
+
+	if store.failedCount() != 0 || store.completedCount() != 0 {
+		t.Error("a failure store error wrote job state")
+	}
+	if !strings.Contains(logs.String(), "fail job") {
+		t.Errorf("failure store error was not logged:\n%s", logs.String())
+	}
+}
+
+func TestProcessHeartbeatStoreErrorIsCounted(t *testing.T) {
+	store := newFakeStore()
+	store.heartbeatErr = errors.New("database unavailable")
+	var logs bytes.Buffer
+	metrics := observability.NewMetrics()
+	registry := registryWith(t, "test.slow", handlers.HandlerFunc(func(context.Context, domain.Job) (json.RawMessage, error) {
+		deadline := time.Now().Add(time.Second)
+		for store.heartbeatCount() == 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		return json.RawMessage(`{"ok":true}`), nil
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.LeaseDuration = time.Second
+		cfg.HeartbeatInterval = 5 * time.Millisecond
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		cfg.Metrics = metrics
+	})
+
+	runner.process(context.Background(), testJob("test.slow", 1, 3))
+
+	if store.completedCount() != 1 {
+		t.Errorf("completed %d jobs, want 1", store.completedCount())
+	}
+	if !strings.Contains(logs.String(), "heartbeat job") {
+		t.Errorf("heartbeat error was not logged:\n%s", logs.String())
+	}
+	recorder := httptest.NewRecorder()
+	metrics.Handler("").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(recorder.Body.String(), "worker_heartbeat_failures_total 1") {
+		t.Errorf("heartbeat failure metric missing:\n%s", recorder.Body.String())
+	}
+}
+
+func TestProcessCancellationStoreErrorIsObserved(t *testing.T) {
+	store := newFakeStore()
+	store.heartbeatCancel = true
+	store.cancelErr = errors.New("database unavailable")
+	var logs bytes.Buffer
+	metrics := observability.NewMetrics()
+	registry := registryWith(t, "test.cancel", handlers.HandlerFunc(func(ctx context.Context, _ domain.Job) (json.RawMessage, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	runner := newRunner(t, store, registry, func(cfg *Config) {
+		cfg.LeaseDuration = time.Second
+		cfg.HeartbeatInterval = 5 * time.Millisecond
+		cfg.HandlerTimeout = time.Second
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		cfg.Metrics = metrics
+	})
+
+	runner.process(context.Background(), testJob("test.cancel", 1, 3))
+
+	if store.cancelledCount() != 0 || store.completedCount() != 0 || store.failedCount() != 0 {
+		t.Error("a cancellation store error wrote job state")
+	}
+	if !strings.Contains(logs.String(), "cancel running job") {
+		t.Errorf("cancellation store error was not logged:\n%s", logs.String())
+	}
+	recorder := httptest.NewRecorder()
+	metrics.Handler("").ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if strings.Contains(recorder.Body.String(), `jobs_cancelled_total{job_type="test.cancel"}`) {
+		t.Errorf("unsuccessful cancellation was counted:\n%s", recorder.Body.String())
 	}
 }
 

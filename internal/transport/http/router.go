@@ -104,10 +104,12 @@ func NewRouter(opts Options) http.Handler {
 		})
 	})
 
-	handler := middleware.SecurityHeaders(mux)
+	// Recoverer runs inside metrics and request logging so panics are observed
+	// as 500 responses by both. Security headers remain outside Recoverer so
+	// the error response still carries the standard headers.
+	handler := middleware.SecurityHeaders(middleware.Recoverer(logger)(mux))
 	handler = middleware.RequestLogger(logger)(handler)
 	handler = middleware.HTTPMetrics(opts.Metrics)(handler)
-	handler = middleware.Recoverer(logger)(handler)
 	return handler
 }
 

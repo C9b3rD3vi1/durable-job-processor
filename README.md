@@ -87,6 +87,8 @@ Requirements:
 - Go 1.26+
 - PostgreSQL 14+ (16 recommended)
 - Docker or Podman Compose, or an existing PostgreSQL instance
+- `python3` for JSON inspection in the examples
+- `jq` and `uuidgen` for the failure drills and some examples
 
 Start the full local stack:
 
@@ -101,9 +103,10 @@ instead:
 docker compose up --build -d
 ```
 
-The stack applies migrations, then starts PostgreSQL, one API, one worker,
-Prometheus and Grafana. The `apikey` Compose service is a one-shot CLI and does
-not stay running; use `docker compose run --rm apikey ...` for key commands.
+Compose starts PostgreSQL first, waits for its health check, applies migrations,
+then starts one API, one worker, Prometheus and Grafana. The `apikey` Compose
+service is a one-shot CLI and does not stay running; use
+`docker compose run --rm apikey ...` for key commands.
 
 Provision a tenant and an operator key:
 
@@ -183,13 +186,13 @@ contracts and all available options.
 
 ```bash
 export BASE='http://localhost:8080'
-export API_KEY='djp_VJXH5VdBqaXeYubgJ5xCR3rCcICc-VvLSfizIslPGns'
-export TENANT_ID='2ea5964c-ad09-49fd-975d-fb48421b1cc4'
+: "${API_KEY:?export the operator key printed by apikey create}"
+: "${TENANT_ID:?export the tenant UUID used with apikey create}"
 ```
 
-That key is the local operator key created earlier. It can perform all job
-actions in its tenant. Treat it as a credential: for any shared or deployed
-environment, create a new key and keep it out of source control.
+Use the key and tenant from the [quick start](#quick-start). The operator key
+can perform all job actions in its tenant. Keys are shown once and cannot be
+recovered; never commit a real key to source control.
 
 Health check:
 
@@ -614,7 +617,8 @@ Common error codes:
 | `invalid_job` | `400` | Job type or payload failed validation |
 | `invalid_job_id` | `400` | Path ID is not a valid UUID |
 | `invalid_argument` | `400` | Query value or argument is out of range |
-| `invalid_query` | `400` | Timestamp filter is not RFC 3339 |
+| `invalid_query` | `400` | Status, limit or timestamp filter is invalid |
+| `request_canceled` | `408` | The request context was canceled |
 | `request_too_large` | `413` | Request body exceeds the configured limit |
 | `invalid_transition` | `409` | Job state does not allow the operation |
 | `quota_exceeded` | `429` | Tenant outstanding-job quota reached |
@@ -695,7 +699,10 @@ Successful job response:
 ```
 
 The public job response deliberately omits `payload`, `idempotency_key`, lease
-fields and creator key ID.
+fields (`locked_by`, `lease_token`, `locked_until`, `heartbeat_at`) and
+`created_by_api_key_id`. It includes `result`, `last_error`, `replayed_at`,
+`cancel_requested_at`, `started_at` and `finished_at` only when those fields are
+set.
 
 ### `GET /v1/jobs/{id}`
 
@@ -861,9 +868,11 @@ FOR UPDATE SKIP LOCKED
 LIMIT 1;
 ```
 
-The claim increments `attempts` and records `locked_by`, `lease_token`,
-`locked_until`, `heartbeat_at` and `started_at` in one committed transaction. No
-row lock is held while the handler runs.
+The full eligibility predicate also excludes rows with a pending cooperative
+cancellation (`AND cancel_requested_at IS NULL`). The claim increments
+`attempts` and records `locked_by`, `lease_token`, `locked_until`,
+`heartbeat_at` and `started_at` in one committed transaction. No row lock is
+held while the handler runs.
 
 ### Leases, heartbeats and fencing
 
@@ -1062,7 +1071,8 @@ Available series include:
 
 - `api_http_requests_total{method,route,status}` and
   `api_http_request_duration_seconds`;
-- `api_rate_limited_total{scope}`;
+- `api_rate_limited_total{scope}` and
+  `api_rate_limiter_unavailable_total{scope}`;
 - `jobs_submitted_total{job_type,result}`, `jobs_completed_total`,
   `jobs_failed_total{job_type,class}`, `jobs_retried_total`,
   `jobs_dead_lettered_total`, `jobs_replayed_total`, `jobs_cancelled_total`;
@@ -1073,8 +1083,8 @@ Available series include:
 - `db_pool_in_use`, `db_pool_idle`, `db_pool_wait_count`, `db_pool_max_conns`.
 
 Metrics are process-local. Scrape every replica and keep `instance` in panel
-legends. Queue gauges are computed once in PostgreSQL but published by every
-worker, so aggregate them with `max()`, not `sum()`.
+legends. Queue gauges are computed from one shared PostgreSQL view but published
+by every worker, so aggregate them with `max()`, not `sum()`.
 
 Local verification:
 
@@ -1184,9 +1194,10 @@ authorization, payload rejection, migration idempotency, atomic claims, queue
 ordering, lease fencing, retry and dead-letter behavior, worker concurrency and
 shutdown, heartbeats, recovery, cancellation, listing, quotas and queue gauges.
 
-Integration tests use throwaway PostgreSQL schemas where appropriate and skip
-when neither `TEST_DATABASE_URL` nor `DATABASE_URL` is set. CI starts a
-PostgreSQL service so the full suite runs on every push and pull request.
+Integration tests use throwaway PostgreSQL schemas where appropriate. A missing
+`TEST_DATABASE_URL` and `DATABASE_URL` skips only the database-backed tests;
+unit tests still run and fail on regressions. CI starts a PostgreSQL service so
+the full suite runs on every push and pull request.
 
 ## Container delivery and CI
 
@@ -1257,3 +1268,9 @@ Makefile                 Common build, test and stack targets
 - [Monitoring runbook](docs/monitoring/runbook.md)
 - [Failure drills](docs/runbooks/failure-drills.md)
 - [Delivery roadmap](docs/ROADMAP.md)
+
+The Mermaid source is the authoritative architecture diagram. The DOCX, SVG and
+PNG files are presentation copies generated from an earlier revision and may
+lag the code; prefer the Mermaid source when checking current behavior. Its
+Terraform, AWS EC2 and Kubernetes branches are design targets only, not
+manifests shipped in this repository.

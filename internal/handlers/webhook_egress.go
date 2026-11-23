@@ -184,10 +184,15 @@ func webhookDialContext(policy WebhookEgressPolicy, resolve ipResolver) func(con
 // redirects disabled. A 3xx response is returned to the handler, which treats
 // it as a permanent failure instead of following it into another destination.
 func newWebhookHTTPClient(policy WebhookEgressPolicy, base *http.Client, resolve ipResolver) *http.Client {
-	client := &http.Client{Timeout: webhookTimeout}
+	client := &http.Client{}
 	if base != nil {
 		cloned := *base
 		client = &cloned
+	}
+	// A caller may shorten or lengthen the timeout, but a zero value must not
+	// silently remove the bounded webhook request window.
+	if client.Timeout <= 0 {
+		client.Timeout = webhookTimeout
 	}
 
 	var transport *http.Transport

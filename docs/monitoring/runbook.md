@@ -142,14 +142,15 @@ heartbeat interval above the lease duration as a workaround.
 
 ## DurableJobExpiredLeaseTerminalOutcomes
 
-**Meaning:** recovery dead-lettered or cancelled more than five expired leases
-in 30 minutes. This usually follows heartbeat failures, worker crashes, pauses
-or cooperative cancellation of long-running handlers.
+**Meaning:** recovery applied more than five terminal outcomes of a single kind
+(`dead` or `cancelled`) to expired leases in 30 minutes. This usually follows
+heartbeat failures, worker crashes, pauses or cooperative cancellation of
+long-running handlers.
 
 **Check:**
 
 ```promql
-sum by (outcome) (rate(worker_expired_leases_total[30m]))
+sum by (outcome) (increase(worker_expired_leases_total[30m]))
 sum(rate(worker_heartbeat_failures_total[10m]))
 sum by (job_type) (rate(jobs_dead_lettered_total[30m]))
 ```
@@ -208,6 +209,39 @@ returns below threshold before closing the incident.
 logs first. This alert is critical because it also masks every other metric-based
 alert for that instance.
 
+## DurableJobAPIMetricsTargetAbsent
+
+**Meaning:** the `durable-job-api` scrape target has disappeared from Prometheus
+discovery for five minutes. Unlike `up == 0`, this catches a removed or renamed
+target, which would otherwise produce no series at all.
+
+**Check:**
+
+```promql
+up{job="durable-job-api"}
+absent(up{job="durable-job-api"})
+```
+
+**Response:** compare `monitoring/prometheus/prometheus.yml` with the running
+service names and labels. Restore the target or update the scrape configuration
+intentionally.
+
+## DurableJobWorkerMetricsTargetAbsent
+
+**Meaning:** the `durable-job-worker` scrape target has disappeared from
+Prometheus discovery for five minutes. Queue gauges and worker counters will be
+silently missing.
+
+**Check:**
+
+```promql
+up{job="durable-job-worker"}
+absent(up{job="durable-job-worker"})
+```
+
+**Response:** confirm the worker deployment still exists and that its metrics
+port is discoverable. Update the scrape configuration if the job name changed.
+
 ## DurableJobRateLimitSpike
 
 **Meaning:** more than 100 requests were rejected by tenant rate limits in 15
@@ -217,6 +251,7 @@ minutes.
 
 ```promql
 sum by (scope) (increase(api_rate_limited_total[15m]))
+sum by (scope) (increase(api_rate_limiter_unavailable_total[15m]))
 ```
 
 `scope` distinguishes the general per-tenant budget from the submission budget.

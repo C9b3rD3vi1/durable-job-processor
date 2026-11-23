@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -94,12 +95,15 @@ func Load() (Config, error) {
 
 	httpAddr := envString("HTTP_ADDR", "")
 	if httpAddr == "" {
-		port := envString("PORT", "8080")
+		port := envString("PORT", strings.TrimPrefix(defaultHTTPAddr, ":"))
 		portNumber, err := strconv.Atoi(port)
 		if err != nil || portNumber < 1 || portNumber > 65535 {
 			return Config{}, fmt.Errorf("PORT must be a number between 1 and 65535")
 		}
 		httpAddr = ":" + port
+	}
+	if err := validateListenAddr("HTTP_ADDR", httpAddr); err != nil {
+		return Config{}, err
 	}
 	cfg.HTTPAddr = httpAddr
 
@@ -178,6 +182,9 @@ func Load() (Config, error) {
 	if cfg.DBMinConns < 0 || cfg.DBMinConns > cfg.DBMaxConns {
 		return Config{}, fmt.Errorf("DB_MIN_CONNS must be between 0 and DB_MAX_CONNS")
 	}
+	if cfg.DBConnectTimeout <= 0 {
+		return Config{}, fmt.Errorf("DB_CONNECT_TIMEOUT must be positive")
+	}
 	if cfg.WorkerConcurrency < 1 {
 		return Config{}, fmt.Errorf("WORKER_CONCURRENCY must be at least 1")
 	}
@@ -198,6 +205,9 @@ func Load() (Config, error) {
 	}
 	if cfg.RetryMaxDelay <= 0 {
 		return Config{}, fmt.Errorf("RETRY_MAX_DELAY must be positive")
+	}
+	if cfg.RetryMaxDelay < cfg.RetryBaseDelay {
+		return Config{}, fmt.Errorf("RETRY_MAX_DELAY must be greater than or equal to RETRY_BASE_DELAY")
 	}
 	if cfg.RecoveryInterval <= 0 {
 		return Config{}, fmt.Errorf("RECOVERY_INTERVAL must be positive")
@@ -227,10 +237,10 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("WEBHOOK_ALLOW_PRIVATE_IPS must be false when APP_ENV is production")
 	}
 	if cfg.MetricsEnabled {
-		host, _, err := net.SplitHostPort(cfg.MetricsAddr)
-		if err != nil {
-			return Config{}, fmt.Errorf("METRICS_ADDR must be host:port: %w", err)
+		if err := validateListenAddr("METRICS_ADDR", cfg.MetricsAddr); err != nil {
+			return Config{}, err
 		}
+		host, _, _ := net.SplitHostPort(cfg.MetricsAddr)
 		if !loopbackHost(host) && cfg.MetricsToken == "" {
 			return Config{}, fmt.Errorf("METRICS_TOKEN is required when METRICS_ADDR is not loopback")
 		}
@@ -246,7 +256,25 @@ func Load() (Config, error) {
 
 // RequestBodyLimit bounds the whole HTTP request, including JSON framing.
 func (c Config) RequestBodyLimit() int64 {
-	return c.MaxPayloadBytes + 64*1024
+	const overhead = int64(64 * 1024)
+	if c.MaxPayloadBytes > math.MaxInt64-overhead {
+		return math.MaxInt64
+	}
+	return c.MaxPayloadBytes + overhead
+}
+
+// validateListenAddr checks the host:port shape and numeric port range shared
+// by the API and metrics listeners.
+func validateListenAddr(name, addr string) error {
+	_, rawPort, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s must be host:port: %w", name, err)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%s port must be a number between 1 and 65535", name)
+	}
+	return nil
 }
 
 func loopbackHost(host string) bool {

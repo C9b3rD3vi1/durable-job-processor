@@ -6,12 +6,12 @@ running and use `jq` to extract job IDs. Set the local environment first:
 
 ```bash
 export BASE='http://localhost:8080'
-export API_KEY='djp_VJXH5VdBqaXeYubgJ5xCR3rCcICc-VvLSfizIslPGns'
-export TENANT_ID='2ea5964c-ad09-49fd-975d-fb48421b1cc4'
+: "${API_KEY:?export the operator key printed by apikey create}"
+: "${TENANT_ID:?export the tenant UUID used with apikey create}"
 ```
 
-The values above are the local operator key and tenant from the development
-stack. Use your own key and tenant when running elsewhere.
+Use the key and tenant from the quick start in the README. Keep the key out of
+source control and use a disposable tenant for these drills.
 
 Useful defaults from `compose.yaml`:
 
@@ -45,7 +45,7 @@ docker compose stop worker
 curl -sS -X POST http://localhost:8080/v1/jobs \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Idempotency-Key: drill-worker-outage-1" \
+  -H "Idempotency-Key: drill-worker-outage-$(uuidgen)" \
   -d '{"job_type":"report.generate","payload":{"report_id":"drill-1","format":"pdf"}}' > /tmp/drill-job.json
 
 JOB_ID="$(jq -r .id /tmp/drill-job.json)"
@@ -67,7 +67,7 @@ docker compose stop worker
 curl -sS -X POST http://localhost:8080/v1/jobs \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Idempotency-Key: drill-expired-lease-1" \
+  -H "Idempotency-Key: drill-expired-lease-$(uuidgen)" \
   -d '{"job_type":"report.generate","payload":{"report_id":"drill-lease","format":"pdf"}}' > /tmp/drill-lease.json
 
 JOB_ID="$(jq -r .id /tmp/drill-lease.json)"
@@ -93,12 +93,10 @@ increments.
 
 ## 4. Dead-letter and operator replay
 
-Use the tenant UUID from the operator key used to create the stack. Insert a
-terminal job directly so the drill does not depend on an external failure:
+Use the exported tenant UUID from the operator key. Insert a terminal job
+directly so the drill does not depend on an external failure:
 
 ```bash
-TENANT_ID="<tenant-uuid-from-apikey-list>"
-
 DEAD_ID="$(docker compose exec -T postgres psql -U jobs -d jobs -t -A -c "
   INSERT INTO jobs (
     id, tenant_id, job_type, payload, status, attempts, max_attempts,
@@ -153,7 +151,7 @@ docker compose exec -T postgres psql -U jobs -d jobs -c "
 curl -sS -i -X POST "$BASE/v1/jobs" \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Idempotency-Key: drill-quota-reject-1" \
+  -H "Idempotency-Key: drill-quota-reject-$(uuidgen)" \
   -d '{"job_type":"report.generate","payload":{"report_id":"drill-quota-reject"}}'
 ```
 
@@ -161,6 +159,16 @@ curl -sS -i -X POST "$BASE/v1/jobs" \
 repeat of a key that already exists still returns `200` because that job is
 already counted. The quota check, lookup and insert share one transaction and a
 tenant-scoped advisory lock, so concurrent submissions cannot overshoot.
+
+Delete the 1000 synthetic jobs before continuing. Otherwise this tenant stays at
+its outstanding-job quota and later drills that submit jobs will fail for the
+wrong reason:
+
+```bash
+docker compose exec -T postgres psql -U jobs -d jobs -c "
+  DELETE FROM jobs WHERE payload->>'report_id' LIKE 'drill-quota-%';
+"
+```
 
 ## 7. Shared rate-limit behavior
 
@@ -181,7 +189,7 @@ done | sort | uniq -c
 curl -sS -i -X POST "$BASE/v1/jobs" \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Idempotency-Key: drill-rate-over" \
+  -H "Idempotency-Key: drill-rate-over-$(uuidgen)" \
   -d '{"job_type":"report.generate","payload":{"report_id":"drill-rate-over"}}'
 ```
 
@@ -201,7 +209,7 @@ until curl -fsS http://localhost:8081/health/ready >/dev/null; do sleep 1; done
 curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8081/v1/jobs \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Idempotency-Key: drill-rate-replica" \
+  -H "Idempotency-Key: drill-rate-replica-$(uuidgen)" \
   -d '{"job_type":"report.generate","payload":{"report_id":"drill-rate-replica"}}'
 
 docker rm -f djp-rate-drill-replica >/dev/null
@@ -211,6 +219,16 @@ docker rm -f djp-rate-drill-replica >/dev/null
 The counter resets at the next minute boundary. If the store is unavailable,
 requests fail closed with `503 rate_limiter_unavailable` instead of bypassing
 the budget.
+
+Wait for the next minute boundary or clear this tenant's counters before drill
+8; otherwise its submissions will be rejected by the submission budget instead
+of exercising webhook validation:
+
+```bash
+docker compose exec -T postgres psql -U jobs -d jobs -c "
+  DELETE FROM rate_limit_counters WHERE tenant_id = '$TENANT_ID';
+"
+```
 
 ## 8. Webhook SSRF rejection
 
@@ -245,7 +263,7 @@ A public destination is accepted:
 RESPONSE="$(curl -sS -X POST "$BASE/v1/jobs" \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Idempotency-Key: drill-ssrf-public" \
+  -H "Idempotency-Key: drill-ssrf-public-$(uuidgen)" \
   -d '{"job_type":"webhook.deliver","payload":{"url":"https://example.com/webhook"}}')"
 echo "$RESPONSE" | jq '{id, status}'
 ```
@@ -363,7 +381,13 @@ Release the port and confirm a clean start:
 
 ```bash
 kill "$BLOCKER_PID"
-timeout 5s env METRICS_ADDR=127.0.0.1:19090 HTTP_ADDR=:18080 go run ./cmd/api || true
+if timeout 5s env METRICS_ADDR=127.0.0.1:19090 HTTP_ADDR=:18080 go run ./cmd/api; then
+  echo "unexpected clean exit; expected timeout" >&2
+else
+  STATUS=$?
+  echo "timeout exit status: $STATUS"
+  test "$STATUS" -eq 124
+fi
 ```
 
 **Expected:** logs show `api listening`; the `timeout` exit status is `124`, not
@@ -381,12 +405,17 @@ not loopback`. Restore the stack with `docker compose start api`.
 ```bash
 docker compose restart api worker
 docker compose exec -T postgres psql -U jobs -d jobs -c "
-  DELETE FROM jobs WHERE payload->>'report_id' LIKE 'drill-%';
+  DELETE FROM jobs
+  WHERE idempotency_key LIKE 'drill-%'
+     OR payload->>'report_id' LIKE 'drill-%'
+     OR payload->>'url' LIKE 'drill-%';
 "
 ```
 
-The cleanup removes drill jobs but not the `rate_limit_counters` rows; those
-reset at the next minute boundary. Remove inactive counters with
+Drill jobs are identified by idempotency key or payload marker, including the
+synthetic quota rows and webhook-only submissions. Rate-limit counters are not
+removed here because they reset at the next minute boundary. Remove inactive
+counters with
 `DELETE FROM rate_limit_counters WHERE updated_at < now() - interval '1 day';`
 when needed.
 

@@ -16,7 +16,9 @@ import (
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/auth"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/domain"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/jobs"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/observability"
 	"github.com/C9b3rD3vi1/durable-job-processor/internal/transport/http/dto"
+	"github.com/C9b3rD3vi1/durable-job-processor/internal/transport/http/middleware"
 	"github.com/google/uuid"
 )
 
@@ -82,6 +84,20 @@ func (f *fakeService) Cancel(_ context.Context, actor jobs.Actor, id uuid.UUID) 
 	f.gotID = id
 	return f.cancelJob, f.cancelRequest, f.cancelErr
 }
+
+type panickingJobService struct{ *fakeService }
+
+func (*panickingJobService) Get(context.Context, jobs.Actor, uuid.UUID) (*domain.Job, error) {
+	panic("boom")
+}
+
+type failingRateLimitStore struct{}
+
+func (failingRateLimitStore) Allow(context.Context, string, uuid.UUID, int, time.Duration) (bool, time.Duration, error) {
+	return false, 0, errors.New("rate limit store unavailable")
+}
+
+var _ middleware.RateLimitStore = failingRateLimitStore{}
 
 type fakePinger struct{ err error }
 
@@ -321,8 +337,12 @@ func TestListJobsRejectsInvalidQuery(t *testing.T) {
 
 	for _, query := range []string{
 		"limit=not-a-number",
+		"limit=0",
+		"limit=101",
+		"status=not-a-status",
 		"created_after=yesterday",
 		"created_before=2026-11-16",
+		"created_after=2026-11-16T00:00:00Z&created_before=2026-11-01T00:00:00Z",
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/v1/jobs?"+query, nil)
 		authenticate(req, clientToken)
@@ -339,6 +359,78 @@ func TestListJobsRejectsInvalidQuery(t *testing.T) {
 		if response.Error.Code != "invalid_query" {
 			t.Errorf("query %q error code = %q, want invalid_query", query, response.Error.Code)
 		}
+	}
+}
+
+func TestRecoveredPanicIsCountedAndLogged(t *testing.T) {
+	tenantID := uuid.New()
+	metrics := observability.NewMetrics()
+	var logs bytes.Buffer
+	router := NewRouter(Options{
+		JobService:    &panickingJobService{fakeService: &fakeService{}},
+		Pinger:        fakePinger{},
+		Authenticator: testAuthenticator(tenantID),
+		Logger:        slog.New(slog.NewTextHandler(&logs, nil)),
+		Metrics:       metrics,
+		MaxBodyBytes:  1 << 20,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+uuid.NewString(), nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "internal_error") {
+		t.Errorf("body = %q, want internal_error", rec.Body.String())
+	}
+	if got := logs.String(); !strings.Contains(got, "panic recovered") || !strings.Contains(got, "status=500") {
+		t.Errorf("logs missing panic or final status 500:\n%s", got)
+	}
+	metricsBody := httptest.NewRecorder()
+	metrics.Handler("").ServeHTTP(metricsBody, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(metricsBody.Body.String(),
+		`api_http_requests_total{method="GET",route="/v1/jobs/{id}",status="500"} 1`) {
+		t.Errorf("panic was not counted as a 500:\n%s", metricsBody.Body.String())
+	}
+}
+
+func TestRateLimitStoreFailureFailsClosedThroughRouter(t *testing.T) {
+	tenantID := uuid.New()
+	metrics := observability.NewMetrics()
+	router := NewRouter(Options{
+		JobService:         &fakeService{},
+		Pinger:             fakePinger{},
+		Authenticator:      testAuthenticator(tenantID),
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Metrics:            metrics,
+		MaxBodyBytes:       1 << 20,
+		RateLimitPerMinute: 5,
+		RateLimitStore:     failingRateLimitStore{},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs", nil)
+	authenticate(req, clientToken)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body=%s", rec.Code, rec.Body.String())
+	}
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Code != "rate_limiter_unavailable" {
+		t.Errorf("error code = %q, want rate_limiter_unavailable", response.Error.Code)
+	}
+	metricsBody := httptest.NewRecorder()
+	metrics.Handler("").ServeHTTP(metricsBody, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(metricsBody.Body.String(), `api_rate_limiter_unavailable_total{scope="request"} 1`) {
+		t.Errorf("unavailable store error was not counted:\n%s", metricsBody.Body.String())
 	}
 }
 

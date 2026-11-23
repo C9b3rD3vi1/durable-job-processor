@@ -69,34 +69,57 @@ your traffic and SLOs. Alert annotations link to the [runbook](runbook.md).
 
 ## Dashboard queries
 
-Metrics are process-local, so scrape every replica and aggregate explicitly.
-Queue depth and age gauges are computed once in PostgreSQL but published by
-every worker; use `max()` for them, **not** `sum()`, or the backlog is multiplied
-by the worker count.
+The provisioned dashboard in
+[`monitoring/grafana/dashboards/durable-job-processor.json`](../../monitoring/grafana/dashboards/durable-job-processor.json)
+contains exactly these panels:
 
 | Panel | Prometheus expression |
 |---|---|
 | Queue depth | `max(jobs_queue_depth)` |
 | Oldest due job age | `max(jobs_oldest_due_seconds)` |
-| Submission throughput | `sum(rate(jobs_submitted_total{result="created"}[5m]))` |
-| Completion throughput | `sum(rate(jobs_completed_total[5m]))` |
-| Job failures by type/class | `sum by (job_type, class) (rate(jobs_failed_total[5m]))` |
-| Dead letters | `sum(rate(jobs_dead_lettered_total[5m]))` |
-| p95 job wait | `histogram_quantile(0.95, sum by (le) (rate(job_wait_duration_seconds_bucket[5m])))` |
-| p95 execution time | `histogram_quantile(0.95, sum by (le) (rate(job_execution_duration_seconds_bucket[5m])))` |
-| p95 API latency | `histogram_quantile(0.95, sum by (le) (rate(api_http_request_duration_seconds_bucket[5m])))` |
+| Job throughput | `sum(rate(jobs_submitted_total{result="created"}[5m]))` and `sum(rate(jobs_completed_total[5m]))` |
+| Failures | `sum(rate(jobs_failed_total[5m]))` and `sum(rate(jobs_dead_lettered_total[5m]))` |
+| API requests by status | `sum by (status) (rate(api_http_requests_total[5m]))` |
+| Database pool usage | `max(db_pool_in_use / clamp_min(db_pool_max_conns, 1))` |
+| Job wait time | `histogram_quantile(0.95, sum by (le) (rate(job_wait_duration_seconds_bucket[15m])))` |
 | Active handlers | `sum(worker_active_count)` |
-| DB pool usage | `max(db_pool_in_use / clamp_min(db_pool_max_conns, 1))` |
-| DB connection waiters | `sum(db_pool_wait_count)` (cumulative count) |
-| API 5xx ratio | `sum(rate(api_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(api_http_requests_total[5m])), 0.001)` |
 
-Useful Grafana variables:
+Metrics are process-local, so scrape every replica and aggregate explicitly.
+Queue depth and age gauges are computed from one shared PostgreSQL view but
+published by every worker; use `max()` for them, **not** `sum()`, or the backlog
+is multiplied by the worker count. Queue gauges refresh every 15 seconds. Keep
+`instance` in panel legends when debugging a single replica.
+
+Additional queries are useful for ad-hoc diagnosis but are not provisioned as
+dashboard panels:
+
+```promql
+sum by (job_type, class) (rate(jobs_failed_total[5m]))
+sum(increase(jobs_cancelled_total[15m]))
+sum by (scope) (rate(api_rate_limited_total[5m]))
+sum by (scope) (rate(api_rate_limiter_unavailable_total[5m]))
+histogram_quantile(0.95, sum by (le) (rate(job_execution_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le) (rate(api_http_request_duration_seconds_bucket[5m])))
+sum(db_pool_wait_count)
+sum(rate(api_http_requests_total{status=~"5.."}[5m]))
+  / clamp_min(sum(rate(api_http_requests_total[5m])), 0.001)
+absent(up{job="durable-job-api"})
+absent(up{job="durable-job-worker"})
+```
+
+Useful Grafana variables for user-created dashboards:
 
 - `job`: `label_values(up{job=~"durable-job-.*"}, job)`
 - `instance`: `label_values(up{job="$job"}, instance)`
 - `job_type`: `label_values(jobs_submitted_total, job_type)`
 - `route`: `label_values(api_http_requests_total, route)`
 
-Queue gauges refresh every 15 seconds from the database clock. Counters and
-histograms reflect only the process that emitted them; keep `instance` in panel
-legends when debugging a single replica.
+The shipped dashboard provisions no template variables; add these locally when
+customising it.
+
+## Alert coverage
+
+The starter rules include `up == 0` checks for unreachable targets and separate
+`absent()` rules for missing API and worker scrape targets. A target can vanish
+from discovery entirely, in which case `up == 0` produces no series; the
+`absent()` rules cover that case. See [`runbook.md`](runbook.md) for responses.

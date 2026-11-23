@@ -202,6 +202,15 @@ var allowedWebhookHeaders = map[string]struct{}{
 	"x-idempotency-key":  {},
 }
 
+// normalizeWebhookHeaderName returns the canonical lowercase name used by both
+// validation and request construction. Validation and execution must agree on
+// the exact string passed to http.Header.Set.
+func normalizeWebhookHeaderName(name string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	_, allowed := allowedWebhookHeaders[normalized]
+	return normalized, allowed
+}
+
 func validateWebhookDeliverPayload(policy WebhookEgressPolicy, raw json.RawMessage) (webhookDeliverPayload, error) {
 	var payload webhookDeliverPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -216,10 +225,19 @@ func validateWebhookDeliverPayload(policy WebhookEgressPolicy, raw json.RawMessa
 		return payload, err
 	}
 
-	for name := range payload.Headers {
-		if _, allowed := allowedWebhookHeaders[strings.ToLower(strings.TrimSpace(name))]; !allowed {
-			return payload, fmt.Errorf("webhook.deliver header %q is not allowed", name)
+	if len(payload.Headers) > 0 {
+		normalized := make(map[string]string, len(payload.Headers))
+		for name, value := range payload.Headers {
+			headerName, allowed := normalizeWebhookHeaderName(name)
+			if !allowed {
+				return payload, fmt.Errorf("webhook.deliver header %q is not allowed", name)
+			}
+			if _, exists := normalized[headerName]; exists {
+				return payload, fmt.Errorf("webhook.deliver header %q is duplicated after normalization", headerName)
+			}
+			normalized[headerName] = value
 		}
+		payload.Headers = normalized
 	}
 
 	body := bytes.TrimSpace(payload.Body)
@@ -275,7 +293,9 @@ func (h *WebhookDeliverHandler) Execute(ctx context.Context, job domain.Job) (js
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		statusErr := fmt.Errorf("webhook.deliver returned HTTP %d", resp.StatusCode)
 		switch {
-		case resp.StatusCode >= http.StatusInternalServerError:
+		case resp.StatusCode >= http.StatusInternalServerError,
+			resp.StatusCode == http.StatusRequestTimeout,
+			resp.StatusCode == http.StatusTooManyRequests:
 			return nil, retry.Transient(statusErr)
 		case resp.StatusCode >= http.StatusBadRequest && resp.StatusCode < http.StatusInternalServerError:
 			return nil, retry.Permanent(statusErr)
