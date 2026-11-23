@@ -1,249 +1,672 @@
 # Durable Job Processor
 
-A fault-tolerant background job processing system built with Go and PostgreSQL.
+A durable background job processing system built in Go with PostgreSQL as the
+source of truth. The API accepts typed jobs, the worker executes them with
+bounded concurrency, and PostgreSQL stores the queue, leases, attempts, results,
+errors, replay history and API credentials.
 
-**Phases 1–8 are implemented:** durable submission and retrieval, a worker that
-executes typed handlers with bounded concurrency, the reliability layer
-(expiring leases, heartbeats, lease-token fencing, expired-job recovery,
-jittered retries, dead-lettering and audited manual replay), hashed API keys that
-derive tenant and role from verified identity, owner-or-operator authorization,
-payload schema validation, cursor-paginated listing, cooperative cancellation,
-tenant quotas and rate limits, SSRF-hardened webhook delivery, structured logs,
-health probes, Prometheus metrics with alerts and runbooks, plus Docker images,
-a Compose stack and CI. AWS/Terraform and the Kubernetes lab remain for later
-phases.
+This document is the technical reference for running, operating and using the
+system. For design history and delivery status, see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-## What works in Phases 2–3
+## Contents
 
-- A separate `cmd/worker` binary shares the PostgreSQL store with the API.
-- A handler registry maps each allow-listed job type to an executable handler;
-  the API and worker therefore agree on what can be submitted and run.
-- Atomic job claiming with `FOR UPDATE SKIP LOCKED`, priority/run-at ordering and
-  a per-claim lease token.
-- Lifecycle transitions from `queued`/`retry_wait` to `running`, then to
-  `succeeded`, `retry_wait` or terminal `dead`.
-- Bounded concurrency: `WORKER_CONCURRENCY` independent claim loops, each
-  processing one job at a time, so multiple workers and multiple processes can
-  share the queue without duplicate active claims.
-- Per-handler timeouts, panic recovery and fenced completion/failure writes.
-- Graceful shutdown stops claiming immediately, drains in-flight handlers for
-  `SHUTDOWN_TIMEOUT`, then cancels their contexts.
-- Built-in handlers for `report.generate`, `email.send`, `data.import` and a real
-  HTTP `webhook.deliver`.
-- Expiring leases renewed by a per-job heartbeat. A worker that loses its lease
-  is cancelled and cannot write completion or failure state.
-- A background recovery loop requeues running jobs whose lease expired, or
-  dead-letters them once attempts are exhausted.
-- Failure classification through `retry.Transient`, `retry.Permanent` and
-  `retry.Cancelled`. Unknown failures retry conservatively; webhook 4xx
-  responses are permanent while 5xx, network and timeout failures are transient.
-- Full-jitter exponential backoff capped by `RETRY_MAX_DELAY`, with
-  `MAX_ATTEMPTS` as the hard retry limit.
-- Dead-letter rows retain attempt count, timestamps and a sanitized error.
-- `POST /v1/jobs/{id}/replay` returns an eligible dead job to `retry_wait`,
-  resets attempts and records `replay_count`, `replayed_by` and `replayed_at`.
+- [System overview](#system-overview)
+- [Quick start](#quick-start)
+- [Access points](#access-points)
+- [Step-by-step usage guide](#step-by-step-usage-guide)
+- [Authentication and authorization](#authentication-and-authorization)
+- [HTTP API](#http-api)
+- [Job types](#job-types)
+- [Job lifecycle and execution model](#job-lifecycle-and-execution-model)
+- [Data model](#data-model)
+- [Configuration](#configuration)
+- [Observability](#observability)
+- [Security boundaries](#security-boundaries)
+- [Operations](#operations)
+- [Testing](#testing)
+- [Container delivery and CI](#container-delivery-and-ci)
+- [Project layout](#project-layout)
+- [Further documentation](#further-documentation)
 
-## What works in Phase 1
+## System overview
 
-- `POST /v1/jobs` — validate and persist a job transactionally, returning `202`.
-- Idempotent submission via the `Idempotency-Key` header. A replay returns the
-  existing job with `200` and `Idempotent-Replayed: true`.
-- `GET /v1/jobs/{id}` — tenant-scoped lookup that survives process restarts.
-- JSON-object payloads validated against each job type's schema, allow-listed job
-  types, priority bounds, per-job maximum attempts and payload-size limits.
-- Versioned, embedded SQL migrations with an advisory lock and `schema_migrations`.
-- PostgreSQL connection pooling, startup ping and graceful shutdown.
-- `GET /health/live` and `GET /health/ready`.
-- Structured request logging and panic recovery.
+The repository builds four binaries from one codebase:
 
-## What works in Phase 6 (tenant hardening)
+| Binary | Responsibility |
+|---|---|
+| `api` | Authenticated HTTP API for submitting, reading, listing, cancelling and replaying jobs |
+| `worker` | Atomic claim loop, handler execution, heartbeats, retries, recovery and shutdown |
+| `migrate` | Applies embedded, versioned PostgreSQL migrations |
+| `apikey` | Creates, lists and revokes API keys |
 
-- Bearer API keys stored only as SHA-256 digests in the `api_keys` table; the
-  plaintext key is printed once at creation.
-- The request tenant comes from the authenticated key, never from a header or
-  payload. `X-Tenant-ID` is no longer accepted.
-- Two roles: `client` submits jobs and inspects/cancels only the jobs it created;
-  `operator` can inspect, cancel and replay any job in its tenant, including
-  dead-letter jobs.
-- Immediate revocation: a revoked key stops authenticating on the next request.
-- `cmd/apikey` provisions, lists and revokes keys without exposing digests.
-- Missing, malformed, unknown and revoked keys return `401`; a valid key without
-  the operator role receives `403` on replay.
-- Submission validates the payload against the registered handler's schema, so
-  malformed jobs return `400 invalid_job` instead of dead-lettering later at
-  execution time.
-- Each job records the API key that created it. A different `client` key's
-  read/cancel request returns `404`; jobs without a recorded creator (created
-  before attribution or inserted directly) remain tenant-visible.
-- `GET /v1/jobs` lists the authenticated tenant's jobs (only those created by the
-  client key, all of them for an operator) with opaque keyset pagination ordered
-  by `(created_at DESC, id DESC)` and filters for `status`, `job_type`,
-  `created_after` and `created_before`.
-- `POST /v1/jobs/{id}/cancel` cancels queued and retry-wait jobs immediately. A
-  running job receives a durable cancellation request that its worker observes
-  on the next heartbeat, cancels the handler context and fences the attempt as
-  `cancelled`. Terminal jobs return `409`.
-- A per-tenant outstanding-job quota counts `queued`, `running` and `retry_wait`
-  rows. Submission is serialized per tenant in PostgreSQL, so concurrent
-  requests cannot overshoot the quota; an idempotent replay is not a new job and
-  does not consume quota.
-- A per-tenant fixed-window request rate limit runs after authentication and
-  returns `429` with `Retry-After` when a tenant exceeds its budget. Job
-  submissions also carry a separate, tighter per-tenant budget so submission
-  bursts cannot spend the general request allowance. These budgets are in-memory
-  per API process. `API_REPLICAS` defaults to `1`; startup fails if it is greater
-  than `1` while either budget is enabled, so the constraint is explicit rather
-  than silent. Scaling the API requires a shared limiter, or both budgets must
-  be deliberately disabled.
+The API and worker share the same PostgreSQL database and the same handler
+registry. The registry is both the submit-time allow-list and the worker
+dispatch table, so a job type accepted by the API is always executable by the
+worker.
 
-Job payloads are deliberately omitted from API responses to avoid exposing
-sensitive data. Lease fields and idempotency keys are internal.
+Request path:
 
-## Requirements
+```text
+client
+  |
+  v
+API router -> auth -> rate limits -> handler -> validator -> PostgreSQL
+                                                        |
+                                                        v
+worker claim loops <- FOR UPDATE SKIP LOCKED <- queue rows
+  |
+  v
+typed handler -> heartbeat/fencing -> result, retry or dead-letter
+```
+
+There is no browser-based job management UI. Grafana is provided for metrics
+only; job operations are performed through the HTTP API.
+
+Implemented capabilities include:
+
+- durable submission and retrieval;
+- idempotent submission and cursor-paginated listing;
+- owner/operator authorization with tenant isolation;
+- immediate and cooperative cancellation;
+- bounded worker concurrency with atomic claims;
+- expiring leases, heartbeats and lease-token fencing;
+- full-jitter exponential backoff, dead-lettering and audited replay;
+- per-tenant quotas and in-memory rate limits;
+- SSRF-hardened webhook delivery;
+- structured logs, health probes and Prometheus metrics;
+- multi-stage container images, a Compose stack and CI.
+
+Not included in this repository: a job-management web UI, job update/delete API,
+distributed rate limiting, AWS/Terraform deployment and a Kubernetes lab. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+## Quick start
+
+Requirements:
 
 - Go 1.26+
 - PostgreSQL 14+ (16 recommended)
-- Docker/Podman Compose, or an existing PostgreSQL instance
+- Docker or Podman Compose, or an existing PostgreSQL instance
 
-## Quick start (Docker Compose)
-
-The full local stack starts with one command:
+Start the full local stack:
 
 ```bash
 make up
 ```
 
-This builds the API, worker, migration and API-key images, applies migrations,
-then starts PostgreSQL, the API, one worker, Prometheus and Grafana. The default
-endpoints are:
+`make up` runs `docker compose up --build` in the foreground. To run it detached
+instead:
 
-| Service | URL | Credentials |
-|---|---|---|
-| API | http://localhost:8080 | API key required |
-| API metrics | http://localhost:9092/metrics | Bearer `local-metrics-token` |
-| Worker metrics | http://localhost:9093/metrics | Bearer `local-metrics-token` |
-| Prometheus | http://localhost:9090 | none |
-| Grafana | http://localhost:3000 | `admin` / `admin` |
-| PostgreSQL | localhost:5432 | `jobs` / `jobs` |
+```bash
+docker compose up --build -d
+```
 
-Prometheus is preconfigured to scrape both metrics endpoints with the same
-development token. If you override `METRICS_TOKEN`, update
-`monitoring/prometheus/prometheus.yml` to match. The starter dashboard is
-provisioned into Grafana automatically.
+The stack applies migrations, then starts PostgreSQL, one API, one worker,
+Prometheus and Grafana. The `apikey` Compose service is a one-shot CLI and does
+not stay running; use `docker compose run --rm apikey ...` for key commands.
 
-Provision an operator key after the stack is healthy:
+Provision a tenant and an operator key:
 
 ```bash
 TENANT_ID="$(uuidgen)"
-docker compose run --rm apikey create -tenant "$TENANT_ID" -name local-dev -role operator
-export API_KEY="djp_..."   # copy the key printed above
-curl -H "Authorization: Bearer $API_KEY" http://localhost:8080/health/ready
+
+docker compose run --rm apikey create \
+  -tenant "$TENANT_ID" \
+  -name local-dev \
+  -role operator
 ```
 
-Use `make down` to stop the stack. Data is kept in named Docker volumes.
-
-### Published container images
-
-Pushes to `main` build and publish four images to GitHub Container Registry:
-
-```text
-ghcr.io/<owner>/durable-job-processor-api:latest
-ghcr.io/<owner>/durable-job-processor-worker:latest
-ghcr.io/<owner>/durable-job-processor-migrate:latest
-ghcr.io/<owner>/durable-job-processor-apikey:latest
-```
-
-`<owner>` and the repository path are lowercased because GHCR requires lowercase
-image names. Each push also receives immutable `main` and full commit-SHA tags.
-Pull requests build every target but never publish or authenticate to the
-registry.
-
-## Local Go development
-
-For running the binaries directly against a local PostgreSQL:
+Copy the printed `djp_...` key. It is shown once and cannot be recovered.
 
 ```bash
-# 1. Start PostgreSQL
+export API_KEY='djp_...'
+
+curl -i -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8080/health/ready
+```
+
+Stop the stack with:
+
+```bash
+make down
+```
+
+Named Docker volumes retain local data unless removed explicitly.
+
+To run the Go binaries directly instead of using Compose:
+
+```bash
 docker compose up -d postgres
 
-# 2. Load environment variables
 cp .env.example .env
 set -a; source .env; set +a
 
-# 3. Apply migrations
 go run ./cmd/migrate
 
-# 4. Provision an API key for a tenant (prints the key once)
 TENANT_ID="$(uuidgen)"
 go run ./cmd/apikey create -tenant "$TENANT_ID" -name local-dev -role operator
-export API_KEY="djp_..."   # copy the key printed above
 
-# 5. Run the API
 go run ./cmd/api
 ```
 
-The API listens on `:8080` by default. In a second terminal with the same
-environment loaded, start the worker:
+In a second terminal with the same environment loaded:
 
 ```bash
 go run ./cmd/worker
 ```
 
-Alternatively, set `AUTO_MIGRATE=true` to apply migrations when the API or
-worker starts. A separate migrate command is recommended for controlled
-deployments.
+`AUTO_MIGRATE=true` applies migrations during API or worker startup, but a
+separate `cmd/migrate` deployment is recommended for controlled rollouts.
 
-## API authentication
+## Access points
 
-Every `/v1` request must send the key as a bearer token:
+| Service | URL | Credentials |
+|---|---|---|
+| Job API | `http://localhost:8080` | Bearer API key |
+| API metrics | `http://localhost:9092/metrics` | Bearer `local-metrics-token` |
+| Worker metrics | `http://localhost:9093/metrics` | Bearer `local-metrics-token` |
+| Prometheus | `http://localhost:9090` | none |
+| Grafana | `http://localhost:3000` | `admin` / `admin` |
+| PostgreSQL | `localhost:5432` | `jobs` / `jobs` |
+
+Prometheus is configured to scrape both metrics listeners with
+`local-metrics-token`. If you override `METRICS_TOKEN`, update
+`monitoring/prometheus/prometheus.yml` to match.
+
+## Step-by-step usage guide
+
+This section walks through every supported local operation. The deeper
+[HTTP API](#http-api) and [configuration](#configuration) sections document the
+contracts and all available options.
+
+### 1. Set the local environment
+
+```bash
+export BASE='http://localhost:8080'
+export API_KEY='djp_VJXH5VdBqaXeYubgJ5xCR3rCcICc-VvLSfizIslPGns'
+export TENANT_ID='2ea5964c-ad09-49fd-975d-fb48421b1cc4'
+```
+
+That key is the local operator key created earlier. It can perform all job
+actions in its tenant. Treat it as a credential: for any shared or deployed
+environment, create a new key and keep it out of source control.
+
+Health check:
+
+```bash
+curl -i "$BASE/health/ready"
+```
+
+### 2. Supported API actions
+
+| Action | Method and route | Who can do it |
+|---|---|---|
+| Create job | `POST /v1/jobs` | client or operator |
+| View one job | `GET /v1/jobs/{id}` | owner client or operator |
+| List jobs | `GET /v1/jobs` | client or operator |
+| Cancel job | `POST /v1/jobs/{id}/cancel` | owner client or operator |
+| Replay dead job | `POST /v1/jobs/{id}/replay` | operator only |
+| Liveness | `GET /health/live` | public |
+| Readiness | `GET /health/ready` | public |
+
+There is no `PUT`, `PATCH`, or `DELETE /v1/jobs/{id}` endpoint.
+
+### 3. Create a job
+
+#### `report.generate`
+
+```bash
+curl -i -X POST "$BASE/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: report-$(uuidgen)" \
+  -d '{
+    "job_type": "report.generate",
+    "payload": {
+      "report_id": "r-1001",
+      "format": "pdf"
+    },
+    "priority": 0,
+    "max_attempts": 5
+  }'
+```
+
+Successful response: `202 Accepted` with a `Location` header.
+
+Capture the job ID:
+
+```bash
+RESPONSE="$(curl -sS -X POST "$BASE/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: report-$(uuidgen)" \
+  -d '{"job_type":"report.generate","payload":{"report_id":"r-1002","format":"pdf"}}')"
+
+JOB_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$RESPONSE")"
+
+echo "$JOB_ID"
+```
+
+#### `email.send`
+
+```bash
+curl -i -X POST "$BASE/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: email-$(uuidgen)" \
+  -d '{
+    "job_type": "email.send",
+    "payload": {
+      "to": "ops@example.com",
+      "template": "welcome"
+    }
+  }'
+```
+
+#### `data.import`
+
+```bash
+curl -i -X POST "$BASE/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: import-$(uuidgen)" \
+  -d '{
+    "job_type": "data.import",
+    "payload": {
+      "source": "s3://bucket/key",
+      "format": "csv"
+    }
+  }'
+```
+
+#### `webhook.deliver`
+
+Only public HTTP(S) destinations are allowed by default.
+
+```bash
+curl -i -X POST "$BASE/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: webhook-$(uuidgen)" \
+  -d '{
+    "job_type": "webhook.deliver",
+    "payload": {
+      "url": "https://example.com/webhook",
+      "body": {"event": "test"},
+      "headers": {"x-webhook-event": "test"}
+    }
+  }'
+```
+
+A URL like `http://127.0.0.1:8080/...` is rejected.
+
+#### Optional submit fields
+
+```json
+{
+  "scheduled_at": "2026-11-24T10:00:00Z",
+  "priority": 5,
+  "max_attempts": 3
+}
+```
+
+Rules:
+
+- `priority`: `-10` to `10`
+- `max_attempts`: `1` to `10`
+- `Idempotency-Key`: max 255 chars
+- `payload` must be a JSON object
+
+An idempotent repeat returns `200` and this header:
+
+```text
+Idempotent-Replayed: true
+```
+
+### 4. View one job
+
+```bash
+curl -sS "$BASE/v1/jobs/$JOB_ID" \
+  -H "Authorization: Bearer $API_KEY" \
+  | python3 -m json.tool
+```
+
+You will see fields such as:
+
+```json
+{
+  "id": "...",
+  "status": "succeeded",
+  "attempts": 1,
+  "result": {
+    "status": "generated"
+  }
+}
+```
+
+Possible statuses:
+
+```text
+queued
+running
+retry_wait
+succeeded
+dead
+cancelled
+```
+
+### 5. List jobs
+
+All jobs:
+
+```bash
+curl -sS "$BASE/v1/jobs" \
+  -H "Authorization: Bearer $API_KEY" \
+  | python3 -m json.tool
+```
+
+Filter by status and type:
+
+```bash
+curl -sS "$BASE/v1/jobs?status=succeeded&job_type=report.generate&limit=25" \
+  -H "Authorization: Bearer $API_KEY" \
+  | python3 -m json.tool
+```
+
+Follow the cursor:
+
+```bash
+NEXT_CURSOR='paste-next_cursor-here'
+
+curl -sS "$BASE/v1/jobs?limit=25&cursor=$NEXT_CURSOR" \
+  -H "Authorization: Bearer $API_KEY" \
+  | python3 -m json.tool
+```
+
+Available filters:
+
+```text
+status
+job_type
+created_after
+created_before
+limit
+cursor
+```
+
+`limit` defaults to `50`, maximum `100`.
+
+### 6. Cancel a job
+
+For a queued or retry-waiting job:
+
+```bash
+curl -i -X POST "$BASE/v1/jobs/$JOB_ID/cancel" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Expected:
+
+- `200` — cancelled or already cancelled
+- `202` — running job got a cooperative cancellation request
+- `409` — already succeeded, dead, or otherwise not cancellable
+- `404` — not found or not visible to your key
+
+### 7. Replay a dead job
+
+Requires an operator key.
+
+```bash
+curl -i -X POST "$BASE/v1/jobs/$JOB_ID/replay" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Expected:
+
+- `200` — job moved to `retry_wait`, attempts reset, `replay_count` incremented
+- `403` — client key used
+- `404` — other tenant or unknown job
+- `409` — job is not dead
+
+### 8. Edit a job
+
+There is no edit/update operation. Jobs are immutable after submission.
+
+To “edit” a job:
+
+1. Cancel it if it is still cancellable.
+2. Submit a new job with the corrected payload.
+
+```bash
+curl -i -X POST "$BASE/v1/jobs/$JOB_ID/cancel" \
+  -H "Authorization: Bearer $API_KEY"
+
+curl -i -X POST "$BASE/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: corrected-$(uuidgen)" \
+  -d '{
+    "job_type": "report.generate",
+    "payload": {
+      "report_id": "r-1002-corrected",
+      "format": "pdf"
+    }
+  }'
+```
+
+### 9. Delete a job
+
+There is no delete API. Completed and cancelled jobs remain as durable history.
+
+For local lab cleanup only, you can delete directly in PostgreSQL:
+
+```bash
+docker compose exec postgres psql -U jobs -d jobs \
+  -c "DELETE FROM jobs WHERE id='$JOB_ID';"
+```
+
+That bypasses the application and should not be treated as a supported product
+operation.
+
+### 10. Manage API keys
+
+Create a new tenant:
+
+```bash
+TENANT_ID="$(uuidgen)"
+```
+
+Create a client key:
+
+```bash
+docker compose run --rm apikey create \
+  -tenant "$TENANT_ID" \
+  -name reporting-client \
+  -role client
+```
+
+Create an operator key:
+
+```bash
+docker compose run --rm apikey create \
+  -tenant "$TENANT_ID" \
+  -name on-call-operator \
+  -role operator
+```
+
+List keys:
+
+```bash
+docker compose run --rm apikey list -tenant "$TENANT_ID"
+```
+
+Revoke a key:
+
+```bash
+docker compose run --rm apikey revoke \
+  -tenant "$TENANT_ID" \
+  -name reporting-client
+```
+
+The plaintext key is shown only once at creation. If lost, revoke it and create
+a new one.
+
+### 11. View internal database state
+
+```bash
+docker compose exec postgres psql -U jobs -d jobs \
+  -c "SELECT id, job_type, status, attempts, max_attempts, last_error FROM jobs ORDER BY created_at DESC LIMIT 20;"
+```
+
+### 12. Monitoring and logs
+
+```bash
+docker compose ps --all
+docker compose logs -f api worker
+```
+
+Metrics:
+
+```bash
+curl -H 'Authorization: Bearer local-metrics-token' \
+  http://localhost:9092/metrics
+
+curl -H 'Authorization: Bearer local-metrics-token' \
+  http://localhost:9093/metrics
+```
+
+Open:
+
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000`, login `admin` / `admin`
+
+The short version: `create`, `view`, `list`, `cancel` and `replay` are API
+operations; `edit` and `delete` jobs are not supported. For those, cancel and
+resubmit, or use raw PostgreSQL locally for cleanup.
+
+## Authentication and authorization
+
+Every `/v1` request requires:
 
 ```http
 Authorization: Bearer djp_...
 ```
 
-Keys are generated with 256 bits of entropy and stored as SHA-256 digests, so the
-database cannot be used to recover a usable credential. Each key belongs to one
-tenant and one role:
+API keys contain 256 bits of entropy. Only their SHA-256 digests are stored in
+`api_keys`; plaintext is printed once by `apikey create`. A lost key must be
+revoked and replaced.
+
+Each key belongs to one tenant and one role:
 
 | Role | Permissions |
 |---|---|
-| `client` | Submit jobs, read jobs in its tenant |
-| `operator` | Everything a client can do, plus replay dead jobs |
+| `client` | Submit jobs; read and cancel jobs it created |
+| `operator` | Submit jobs; read and cancel any job in its tenant; replay dead jobs |
 
-The tenant is derived from the authenticated key. A caller cannot select a
-different tenant with a header or request field; cross-tenant reads and replays
-return `404`.
+The tenant and role are derived from the verified key. Caller-supplied tenant
+headers such as `X-Tenant-ID` are ignored, and payload fields cannot select a
+tenant. Cross-tenant reads and replays return `404` rather than revealing that a
+job exists. Jobs without a recorded creator remain tenant-visible to
+authenticated members of that tenant.
 
-Provision and manage keys with `DATABASE_URL` set:
+Manage keys with `DATABASE_URL` set. Inside Compose:
 
 ```bash
-# Create a client key. The plaintext key is shown once and cannot be retrieved.
-go run ./cmd/apikey create -tenant "$TENANT_ID" -name reporting-client -role client
+docker compose run --rm apikey create \
+  -tenant "$TENANT_ID" -name reporting-client -role client
 
-# Create an operator key for dead-letter replay.
-go run ./cmd/apikey create -tenant "$TENANT_ID" -name on-call-operator -role operator
+docker compose run --rm apikey create \
+  -tenant "$TENANT_ID" -name on-call-operator -role operator
 
-# List keys for a tenant. Digests are never printed.
-go run ./cmd/apikey list -tenant "$TENANT_ID"
+docker compose run --rm apikey list -tenant "$TENANT_ID"
 
-# Revoke a key immediately. Revoking an already revoked key is a no-op.
-go run ./cmd/apikey revoke -tenant "$TENANT_ID" -name reporting-client
+docker compose run --rm apikey revoke \
+  -tenant "$TENANT_ID" -name reporting-client
 ```
 
-Key names are unique within a tenant. If a key is lost, revoke it and create a
-replacement; there is no recovery path by design. Both the general and submission
-rate limits are applied per tenant by the API instance, while outstanding-job
-quotas are enforced durably in PostgreSQL and shared by every API replica.
+Key names are unique within a tenant. Revocation takes effect on the next
+request. Missing, malformed, unknown and revoked keys return `401`; a valid key
+without the operator role receives `403` on replay.
 
-## API examples
+## HTTP API
 
-Submit a job:
+All responses use `application/json`. Errors have a stable envelope:
+
+```json
+{
+  "error": {
+    "code": "invalid_job",
+    "message": "payload for job_type \"report.generate\" is invalid: report.generate requires report_id"
+  }
+}
+```
+
+Common error codes:
+
+| Code | HTTP status | Meaning |
+|---|---|---|
+| `authentication_required` | `401` | No bearer token was supplied |
+| `invalid_api_key` | `401` | Token is unknown, malformed or revoked |
+| `forbidden` | `403` | Caller lacks the required role |
+| `job_not_found` | `404` | Job does not exist or is not visible to the caller |
+| `not_found` | `404` | Route does not exist |
+| `invalid_json` | `400` | Body is not one valid JSON object |
+| `invalid_job` | `400` | Job type or payload failed validation |
+| `invalid_job_id` | `400` | Path ID is not a valid UUID |
+| `invalid_argument` | `400` | Query value or argument is out of range |
+| `invalid_query` | `400` | Timestamp filter is not RFC 3339 |
+| `request_too_large` | `413` | Request body exceeds the configured limit |
+| `invalid_transition` | `409` | Job state does not allow the operation |
+| `quota_exceeded` | `429` | Tenant outstanding-job quota reached |
+| `rate_limited` | `429` | General or submission rate limit reached |
+| `internal_error` | `500` | Unexpected server error |
+
+### `POST /v1/jobs`
+
+Submits a job.
+
+Headers:
+
+- `Authorization: Bearer <api-key>` — required
+- `Content-Type: application/json` — required
+- `Idempotency-Key: <string>` — optional, max 255 characters
+
+Request body:
+
+```json
+{
+  "job_type": "report.generate",
+  "payload": {"report_id": "r-1", "format": "pdf"},
+  "scheduled_at": "2026-11-24T09:00:00Z",
+  "priority": 0,
+  "max_attempts": 5
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `job_type` | string | yes | Must be an allow-listed registered job type |
+| `payload` | JSON object | yes | Validated against the handler's schema |
+| `scheduled_at` | RFC 3339 timestamp | no | Defaults to now; stored as `run_at` |
+| `priority` | integer | no | `-10` to `10`, default `0` |
+| `max_attempts` | integer | no | `1` to `10`, default from `MAX_ATTEMPTS` |
+
+Responses:
+
+- `202 Accepted` for a new job, with a `Location: /v1/jobs/{id}` header.
+- `200 OK` with `Idempotent-Replayed: true` when the idempotency key already
+  exists for the tenant. The original job is returned unchanged.
+- `400` for invalid JSON, unsupported job type or invalid payload.
+- `413` when the body exceeds the request limit.
+- `429` with `quota_exceeded` or `rate_limited` when a limit is reached.
+
+Example:
 
 ```bash
 curl -i -X POST http://localhost:8080/v1/jobs \
-  -H "Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $API_KEY" \
-  -H "Idempotency-Key: report-2026-11-15-001" \
+  -H "Idempotency-Key: report-2026-11-24-001" \
   -d '{
     "job_type": "report.generate",
     "payload": {"report_id": "r-1", "format": "pdf"},
@@ -252,7 +675,7 @@ curl -i -X POST http://localhost:8080/v1/jobs \
   }'
 ```
 
-Expected response: `202 Accepted` with a `Location` header and a body such as:
+Successful job response:
 
 ```json
 {
@@ -261,85 +684,170 @@ Expected response: `202 Accepted` with a `Location` header and a body such as:
   "job_type": "report.generate",
   "status": "queued",
   "priority": 0,
-  "run_at": "2026-11-15T09:00:00Z",
+  "run_at": "2026-11-24T09:00:00Z",
   "attempts": 0,
   "max_attempts": 5,
   "replay_count": 0,
-  "created_at": "2026-11-15T09:00:00Z",
-  "updated_at": "2026-11-15T09:00:00Z"
+  "created_at": "2026-11-24T09:00:00Z",
+  "updated_at": "2026-11-24T09:00:00Z"
 }
 ```
 
-Payloads that fail the registered handler's schema return `400` with error code
-`invalid_job`, and no job is persisted.
+The public job response deliberately omits `payload`, `idempotency_key`, lease
+fields and creator key ID.
 
-Retrieve it:
+### `GET /v1/jobs/{id}`
 
-```bash
-curl http://localhost:8080/v1/jobs/<job-id> \
-  -H "Authorization: Bearer $API_KEY"
-```
-
-List the tenant's jobs newest first. `limit` defaults to 50 and is capped at 100;
-`next_cursor` is opaque and is passed back unchanged:
+Returns one tenant-scoped job. A `client` key can read only jobs it created; an
+`operator` key can read any job in its tenant.
 
 ```bash
-curl "http://localhost:8080/v1/jobs?status=dead&job_type=report.generate&limit=25" \
-  -H "Authorization: Bearer $API_KEY"
-
-# Follow the cursor returned by the previous page.
-curl "http://localhost:8080/v1/jobs?limit=25&cursor=$NEXT_CURSOR" \
-  -H "Authorization: Bearer $API_KEY"
+curl -sS "http://localhost:8080/v1/jobs/$JOB_ID" \
+  -H "Authorization: Bearer $API_KEY" | python3 -m json.tool
 ```
 
-Filters are optional: `status`, `job_type`, `created_after` and `created_before`
-(RFC 3339 timestamps). The response is `{"jobs": [...], "next_cursor": "..."}`;
-`next_cursor` is absent on the final page.
+Responses: `200` on success, `400 invalid_job_id` for a malformed UUID, `404`
+when the job is absent or not visible.
 
-Cancel a job:
+### `GET /v1/jobs`
 
-```bash
-curl -i -X POST http://localhost:8080/v1/jobs/<job-id>/cancel \
-  -H "Authorization: Bearer $API_KEY"
-```
+Lists jobs newest first with opaque keyset pagination.
 
-A queued or retry-wait job becomes `cancelled` immediately and the response is
-`200`. A running job receives a durable cancellation request: the response is
-`202 Accepted` with `Cancel-Requested: true`, the handler's context is cancelled
-on the worker's next heartbeat, and the attempt is fenced to `cancelled`. A job
-that already reached `succeeded`, `dead` or `cancelled` is not cancellable and
-returns `409`. Cancelling an already cancelled job is idempotent.
+Query parameters:
 
-Read and cancel requests follow an owner-or-operator policy: a `client` key can
-act only on jobs it submitted, while an `operator` key can act on any job in its
-tenant. Other client keys receive `404` so ownership cannot be probed.
-
-When a tenant is at `TENANT_MAX_OUTSTANDING_JOBS`, submission returns `429` with
-error code `quota_exceeded`. Completing, cancelling or dead-lettering a job frees
-quota. When the general request budget or the tighter submission budget is
-exhausted, the API returns `429` with error code `rate_limited` and a
-`Retry-After` header.
-
-Supported job types and their built-in handlers:
-
-| Job type | Handler behaviour |
+| Parameter | Notes |
 |---|---|
-| `report.generate` | Simulates report generation and returns `report_id`, `format` and status |
-| `email.send` | Simulates email delivery and validates a recipient address |
-| `webhook.deliver` | POSTs the supplied JSON body to `payload.url` and requires a 2xx response |
-| `data.import` | Simulates an import from `payload.source` |
+| `status` | `queued`, `running`, `retry_wait`, `succeeded`, `dead` or `cancelled` |
+| `job_type` | Exact registered job type |
+| `created_after` | RFC 3339 timestamp |
+| `created_before` | RFC 3339 timestamp |
+| `limit` | `1` to `100`, default `50` |
+| `cursor` | Opaque value from a previous `next_cursor`; URL-encode when sending |
 
-The API rejects a job type that has no registered handler, so the allow-list and
-the worker dispatch table cannot drift.
+```bash
+curl -sS "http://localhost:8080/v1/jobs?status=dead&job_type=report.generate&limit=25" \
+  -H "Authorization: Bearer $API_KEY" | python3 -m json.tool
 
-> **Identity note:** tenancy and authorization come from the verified API key.
-> `X-Tenant-ID` is not accepted, and payload fields cannot select a tenant. Use
-> the `client` role for submission/read clients and the `operator` role only for
-> controlled dead-letter replay.
+curl -sS "http://localhost:8080/v1/jobs?limit=25&cursor=$NEXT_CURSOR" \
+  -H "Authorization: Bearer $API_KEY" | python3 -m json.tool
+```
 
-## Worker execution
+The response is:
 
-A worker repeatedly claims one due job per claim loop:
+```json
+{
+  "jobs": [],
+  "next_cursor": "optional-on-more-pages"
+}
+```
+
+`next_cursor` is omitted on the final page. Client keys see only their own jobs;
+operators see all jobs in their tenant.
+
+### `POST /v1/jobs/{id}/cancel`
+
+Requests cancellation.
+
+```bash
+curl -i -X POST "http://localhost:8080/v1/jobs/$JOB_ID/cancel" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Behavior:
+
+- `queued` or `retry_wait` job: set to `cancelled` immediately, returns `200`.
+- `running` job: returns `202 Accepted` with `Cancel-Requested: true`; the worker
+  observes `cancel_requested_at` on its next heartbeat, cancels the handler
+  context and fences the attempt to `cancelled`.
+- Already `cancelled`: returns `200` idempotently.
+- `succeeded`, `dead` or other non-cancellable state: returns `409`.
+- Another client key's job or another tenant's job: returns `404`.
+
+### `POST /v1/jobs/{id}/replay`
+
+Returns a dead job to `retry_wait`. Requires the `operator` role.
+
+```bash
+curl -i -X POST "http://localhost:8080/v1/jobs/$JOB_ID/replay" \
+  -H "Authorization: Bearer $OPERATOR_API_KEY"
+```
+
+A successful replay returns `200` with `status: "retry_wait"`, `attempts: 0`, an
+incremented `replay_count`, and `replayed_by` / `replayed_at` recorded in the
+durable row. A `client` key receives `403`; a non-dead job returns `409`; a job
+from another tenant returns `404`.
+
+### Health probes
+
+Health endpoints are public and are not part of `/v1`.
+
+| Route | Purpose |
+|---|---|
+| `GET /health/live` | Process is running; returns `{"status":"ok"}` |
+| `GET /health/ready` | Database ping succeeds; returns `{"status":"ready"}` or `503` |
+
+## Job types
+
+The API rejects unknown job types before persistence.
+
+| Job type | Required payload | Optional payload | Result |
+|---|---|---|---|
+| `report.generate` | `report_id` | `format` (default `pdf`) | `report_id`, `format`, `status: "generated"` |
+| `email.send` | `to` containing `@` | `template` | `to`, `template`, `status: "sent"`, `deliverer: "simulator"` |
+| `data.import` | `source` | `format` | `source`, `format`, `status: "imported"` |
+| `webhook.deliver` | public HTTP(S) `url` | `body`, `headers` | `delivered: true`, `status_code` |
+
+Examples:
+
+```json
+{"report_id": "r-1", "format": "pdf"}
+```
+
+```json
+{"to": "ops@example.com", "template": "welcome"}
+```
+
+```json
+{"source": "s3://bucket/key", "format": "csv"}
+```
+
+```json
+{
+  "url": "https://example.com/hook",
+  "body": {"event": "job.completed"},
+  "headers": {"x-webhook-event": "job.completed"}
+}
+```
+
+`webhook.deliver` allows only these caller-supplied headers: `Accept`,
+`User-Agent`, `X-Webhook-Event`, `X-Webhook-Delivery`, `X-Request-Id` and
+`X-Idempotency-Key`. A 2xx response succeeds. 4xx responses are permanent
+failures; 5xx, network errors and timeouts are transient failures.
+
+## Job lifecycle and execution model
+
+States:
+
+```text
+queued ──claim──> running ──success──> succeeded
+   │                 │
+   │                 ├──retryable failure──> retry_wait
+   │                 ├──permanent/exhausted──> dead
+   │                 └──cancellation──> cancelled
+   │
+   └──cancel──> cancelled
+
+retry_wait ──claim──> running
+dead ──operator replay──> retry_wait
+```
+
+`succeeded`, `dead` and `cancelled` are terminal. A replay is the only way out
+of `dead`, and it is an explicit operator action.
+
+### Claiming
+
+Each worker starts `WORKER_CONCURRENCY` claim loops. Each loop claims and runs at
+most one job at a time. Claims use:
 
 ```sql
 SELECT id
@@ -352,182 +860,274 @@ FOR UPDATE SKIP LOCKED
 LIMIT 1;
 ```
 
-The claim increments `attempts`, records `locked_by`, `lease_token`,
-`locked_until`, `heartbeat_at` and `started_at`, and returns the job while
-committing the claim. No row lock is held while the handler runs.
+The claim increments `attempts` and records `locked_by`, `lease_token`,
+`locked_until`, `heartbeat_at` and `started_at` in one committed transaction. No
+row lock is held while the handler runs.
+
+### Leases, heartbeats and fencing
 
 While a handler runs, the worker renews `locked_until` every
 `HEARTBEAT_INTERVAL`. A zero-row heartbeat means another worker owns the job, so
-the handler context is cancelled and its result is discarded. Success and failure
-writes use the same lease-token condition, which fences a stale worker after one
-expired lease has been recovered.
+the handler context is cancelled and its result is discarded.
 
-The heartbeat also reports a durable `cancel_requested_at` set by
-`POST /v1/jobs/{id}/cancel`. The worker cancels the handler context immediately
-and, after the handler returns, fences the attempt to `cancelled` with the lease
-token instead of recording success or failure.
+Completion and failure writes require the same `lease_token` as the claim. A
+stale worker therefore cannot overwrite a job that was recovered and claimed by
+another worker.
 
-A failed handler is classified:
+### Retries and dead-lettering
 
-- transient, cancelled and unknown failures retry with
-  `random(0, min(RETRY_BASE_DELAY * 2^(attempt-1), RETRY_MAX_DELAY))`;
-- permanent failures and exhausted attempts become `dead` immediately;
-- the sanitized error, attempt count and timestamps remain on the row.
+Failures are classified as transient, permanent or cancelled. Unknown failures
+retry conservatively. Retry delay is full jitter:
 
-A separate recovery loop runs every `RECOVERY_INTERVAL` inside each worker. It
-finds `running` rows with `locked_until < now()`, takes them with
-`FOR UPDATE SKIP LOCKED`, and returns them to `retry_wait`, dead-letters them
-according to their attempt count, or finalizes a pending cancellation as
-`cancelled`. The scan and update are one statement, so several workers can run
-recovery concurrently without stealing the same row.
-
-Observe a job after submitting it:
-
-```bash
-curl http://localhost:8080/v1/jobs/<job-id> \
-  -H "Authorization: Bearer $API_KEY"
+```text
+random(0, min(RETRY_BASE_DELAY * 2^(attempt - 1), RETRY_MAX_DELAY))
 ```
 
-The response moves from `queued` to `running` and then to `succeeded` or
-`retry_wait`. Replay a dead job:
+Permanent failures and exhausted attempts move the job to `dead` immediately.
+Dead rows retain the sanitized error, attempt count and timestamps until an
+operator replays them.
 
-```bash
-curl -X POST http://localhost:8080/v1/jobs/<job-id>/replay \
-  -H "Authorization: Bearer $OPERATOR_API_KEY"
-```
+### Recovery
 
-Only `dead` jobs are eligible, and the key must have the `operator` role; a
-`client` key receives `403`. A replay returns the job with `status=retry_wait`,
-`attempts=0` and an incremented `replay_count`; the operator key name is stored
-in `replayed_by`. Replaying any other status returns `409`, and another tenant's
-job returns `404`.
+Every `RECOVERY_INTERVAL`, each worker scans for `running` jobs with an expired
+`locked_until`. The scan and update are one statement using `FOR UPDATE SKIP
+LOCKED`, so concurrent workers do not steal the same row. Recovery:
 
-Inspect the durable row directly for internal fields:
+- requeues eligible jobs to `retry_wait`;
+- dead-letters jobs that exhausted attempts;
+- finalizes a pending cancellation as `cancelled`.
 
-```bash
-docker compose exec postgres psql -U jobs -d jobs \
-  -c "SELECT id, status, attempts, locked_by, last_error FROM jobs ORDER BY created_at DESC LIMIT 10;"
-```
+### Shutdown
 
-Stop the worker with `Ctrl-C` or `SIGTERM`. It stops claiming immediately, lets
-in-flight handlers finish for `SHUTDOWN_TIMEOUT`, then cancels their contexts and
-records a retry for work that could not finish.
+On `SIGTERM` or `SIGINT`, the worker stops claiming immediately and drains
+in-flight handlers for `SHUTDOWN_TIMEOUT`. If that budget expires, handler
+contexts are cancelled and the runner waits one final bounded grace period for
+fenced persistence writes. Handlers that ignore cancellation are abandoned
+rather than blocking process exit; recovery can reclaim their leases.
 
-## Configuration
+## Data model
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `APP_ENV` | `development` | `development`/`local` uses text logs; others use JSON |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `HTTP_ADDR` | `:8080` | Listen address; overrides `PORT` |
-| `PORT` | `8080` | Used when `HTTP_ADDR` is empty |
-| `DATABASE_URL` | required | PostgreSQL connection string |
-| `DB_MAX_CONNS` | `10` | Maximum pool connections |
-| `DB_MIN_CONNS` | `0` | Minimum pool connections |
-| `DB_CONNECT_TIMEOUT` | `5s` | Connection/ping timeout |
-| `AUTO_MIGRATE` | `false` | Apply migrations on API or worker startup |
-| `SHUTDOWN_TIMEOUT` | `15s` | Graceful shutdown budget for API and worker |
-| `WORKER_CONCURRENCY` | `4` | Maximum jobs a worker executes simultaneously |
-| `POLL_INTERVAL` | `1s` | Delay between claim attempts when no job is ready |
-| `LEASE_DURATION` | `60s` | Claim lease recorded in `locked_until` |
-| `HEARTBEAT_INTERVAL` | `15s` | Lease renewal cadence while a handler runs |
-| `HANDLER_TIMEOUT` | `30s` | Per-handler execution deadline |
-| `RETRY_BASE_DELAY` | `5s` | First-attempt backoff ceiling |
-| `RETRY_MAX_DELAY` | `15m` | Maximum exponential backoff ceiling |
-| `RECOVERY_INTERVAL` | `30s` | Background expired-lease scan cadence |
-| `MAX_ATTEMPTS` | `5` | Default maximum attempts per job |
-| `MAX_PAYLOAD_BYTES` | `262144` | Maximum JSON payload size |
-| `TENANT_MAX_OUTSTANDING_JOBS` | `1000` | Queued, running and retry-wait jobs per tenant; `0` disables |
-| `TENANT_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant API requests per fixed minute; `0` disables |
-| `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE` | `120` | Per-tenant `POST /v1/jobs` requests per fixed minute, in addition to the general limit; `0` disables |
-| `API_REPLICAS` | `1` | Declared API replica count; startup fails above `1` while in-memory rate limits are enabled |
-| `WEBHOOK_ALLOWED_HOSTS` | empty | Optional comma-separated webhook destination allow-list; a leading `.` permits subdomains |
-| `WEBHOOK_ALLOW_PRIVATE_IPS` | `false` | Allows loopback/private/link-local webhook destinations for local tests only |
-| `METRICS_ENABLED` | `true` | Serve Prometheus metrics from a dedicated listener in the API and worker |
-| `METRICS_ADDR` | `127.0.0.1:9090` | Metrics listener address; give API and worker different ports when running both locally |
-| `METRICS_TOKEN` | empty | Required bearer token when `METRICS_ADDR` is not loopback |
+PostgreSQL is the durable source of truth. Schema changes are embedded in the
+binaries and applied by `cmd/migrate`.
 
-`LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`. `HANDLER_TIMEOUT` may
-exceed the lease because heartbeats keep the lease alive for the whole handler.
+### `jobs`
 
-### Webhook egress controls
+Important columns:
 
-`webhook.deliver` treats the job payload as untrusted. By default the zero-value
-egress policy allows only public HTTP(S) destinations and rejects loopback, RFC
-1918, link-local (including `169.254.169.254`), multicast, carrier-grade NAT,
-reserved and documentation addresses. Hostnames are resolved at dial time and
-every resolved IP is checked, which prevents DNS rebinding. Redirects are not
-followed, URL credentials are rejected, and caller-supplied headers are limited
-to `Accept`, `User-Agent`, `X-Webhook-Event`, `X-Webhook-Delivery`,
-`X-Request-Id` and `X-Idempotency-Key`.
+| Column group | Columns |
+|---|---|
+| Identity | `id`, `tenant_id`, `created_by_api_key_id` |
+| Definition | `job_type`, `payload`, `priority`, `run_at`, `max_attempts`, `idempotency_key` |
+| Execution | `status`, `attempts`, `locked_by`, `lease_token`, `locked_until`, `heartbeat_at`, `started_at`, `finished_at` |
+| Outcome | `result`, `last_error`, `cancel_requested_at` |
+| Replay audit | `replay_count`, `replayed_by`, `replayed_at` |
+| Timestamps | `created_at`, `updated_at` |
 
-For local development against an `httptest` server, set
-`WEBHOOK_ALLOW_PRIVATE_IPS=true`. Startup refuses this setting when `APP_ENV`
-is `production`, `prod` or `live`. Use `WEBHOOK_ALLOWED_HOSTS` (for example
-`hooks.example.com,.internal.example.org`)
-for an additional hostname allow-list; an empty list permits any public host.
+Constraints and indexes enforce:
 
-### Metrics
+- one idempotency key per tenant;
+- valid job status, attempts, priority and replay count;
+- efficient ready-queue lookup by priority, run-at and creation time;
+- efficient expired-lease recovery;
+- tenant/owner listing and `(tenant_id, created_at DESC, id DESC)` cursor order.
 
-Both binaries expose a Prometheus text-format endpoint at `GET /metrics` on
-`METRICS_ADDR` (default `127.0.0.1:9090`). Because the default binds to loopback
-only, it is private by default. To let Prometheus scrape from another host or
-container, bind to `:9090` and set `METRICS_TOKEN`; the endpoint then requires
-`Authorization: Bearer <METRICS_TOKEN>`. Startup fails if a non-loopback
-`METRICS_ADDR` is configured without a token. Give the API and worker distinct
-ports when running them on the same host.
+### `api_keys`
 
-Instrumented series include:
+`api_keys` stores `id`, `tenant_id`, `name`, `role`, a unique 32-byte `key_hash`,
+`created_at` and `revoked_at`. Names are unique per tenant. Roles are constrained
+to `client` and `operator`.
 
-- `api_http_requests_total{method,route,status}` and
-  `api_http_request_duration_seconds` with normalized route labels
-- `api_rate_limited_total{scope}` for general and submission budgets
-- `jobs_submitted_total{job_type,result}`, `jobs_completed_total`,
-  `jobs_failed_total{job_type,class}`, `jobs_retried_total`,
-  `jobs_dead_lettered_total`, `jobs_replayed_total`, `jobs_cancelled_total`
-- `job_attempts_total`, `job_wait_duration_seconds`,
-  `job_execution_duration_seconds`, `worker_active_count`
-- `worker_heartbeat_failures_total`, `worker_expired_leases_total{outcome}`
-- `jobs_queue_depth`, `jobs_oldest_due_seconds` (PostgreSQL-derived backlog gauges)
-- `db_pool_in_use`, `db_pool_idle`, `db_pool_wait_count`, `db_pool_max_conns`
+### Migrations
 
-Metrics are process-local; each API/worker replica exposes its own registry, so
-scrape each instance with its own `instance` label. Queue gauges are computed
-once in PostgreSQL but published by every worker: aggregate them with `max()`,
-not `sum()`.
+| Migration | Purpose |
+|---|---|
+| `0001_create_jobs.sql` | Job status enum, jobs table, constraints and initial indexes |
+| `0002_add_replay_audit.sql` | Replay count, actor and timestamp |
+| `0003_add_api_keys.sql` | API key table, role and hash constraints |
+| `0004_add_cancellation.sql` | Cancellation timestamp and listing index |
+| `0005_add_job_owner.sql` | Creator attribution and tenant/owner index |
 
-Prometheus scrape configuration, starter alert rules, dashboard queries and the
-on-call runbook are in [`docs/monitoring`](docs/monitoring/README.md) and
-[`monitoring/prometheus/alerts.yml`](monitoring/prometheus/alerts.yml). The
-Compose stack loads `monitoring/prometheus/prometheus.yml` and provisions a
-Grafana dashboard from `monitoring/grafana/dashboards/`.
+Applied versions are tracked in `schema_migrations`. An advisory lock prevents
+concurrent migration runs from racing.
 
-## Database migrations
-
-Migrations live in `migrations/` and are embedded into both the API and migrate
-binary. Files use `<version>_<description>.sql` naming. Applied versions are
-tracked in `schema_migrations`, and an advisory lock prevents concurrent deploys
-from racing.
+Apply migrations explicitly with:
 
 ```bash
 go run ./cmd/migrate
 ```
 
-`migrations/0001_create_jobs.sql` creates the documented `job_status` enum, the
-`jobs` table, validation constraints and the ready/lease/tenant/idempotency
-indexes. `migrations/0002_add_replay_audit.sql` adds the durable
-`replay_count`, `replayed_by` and `replayed_at` audit columns.
-`migrations/0003_add_api_keys.sql` adds the `api_keys` table with role checks,
-per-tenant unique names, unique 32-byte SHA-256 digests and revocation
-timestamps. `migrations/0004_add_cancellation.sql` adds `cancel_requested_at`
-and the `(tenant_id, created_at DESC, id DESC)` index used by cursor pagination.
-`migrations/0005_add_job_owner.sql` adds `created_by_api_key_id` and the tenant
-owner index used for owner-scoped job visibility.
+## Configuration
 
-## Tests
+Configuration is read from environment variables. Invalid values fail at
+startup.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `APP_ENV` | `development` | `development`/`local` use text logs; others use JSON |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `HTTP_ADDR` | `:8080` | API listen address; overrides `PORT` |
+| `PORT` | `8080` | Used when `HTTP_ADDR` is empty |
+| `DATABASE_URL` | required | PostgreSQL connection string |
+| `DB_MAX_CONNS` | `10` | Maximum pool connections |
+| `DB_MIN_CONNS` | `0` | Minimum pool connections |
+| `DB_CONNECT_TIMEOUT` | `5s` | Connection and ping timeout |
+| `AUTO_MIGRATE` | `false` | Apply migrations on API or worker startup |
+| `SHUTDOWN_TIMEOUT` | `15s` | Worker drain budget; API shutdown budget |
+| `WORKER_CONCURRENCY` | `4` | Maximum simultaneous handlers |
+| `POLL_INTERVAL` | `1s` | Delay between claim attempts when no job is ready |
+| `LEASE_DURATION` | `60s` | Claim lease stored in `locked_until` |
+| `HEARTBEAT_INTERVAL` | `15s` | Lease renewal cadence |
+| `HANDLER_TIMEOUT` | `30s` | Per-handler execution deadline |
+| `RETRY_BASE_DELAY` | `5s` | First-attempt backoff ceiling |
+| `RETRY_MAX_DELAY` | `15m` | Maximum backoff ceiling |
+| `RECOVERY_INTERVAL` | `30s` | Expired-lease scan cadence |
+| `MAX_ATTEMPTS` | `5` | Default maximum attempts per job |
+| `MAX_PAYLOAD_BYTES` | `262144` | Maximum JSON payload size |
+| `TENANT_MAX_OUTSTANDING_JOBS` | `1000` | `queued`/`running`/`retry_wait` jobs per tenant; `0` disables |
+| `TENANT_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant API requests per fixed minute; `0` disables |
+| `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE` | `120` | Additional per-tenant submit budget per fixed minute; `0` disables |
+| `API_REPLICAS` | `1` | Declared API replica count; see rate-limit constraint below |
+| `WEBHOOK_ALLOWED_HOSTS` | empty | Comma-separated destination allow-list; leading `.` permits subdomains |
+| `WEBHOOK_ALLOW_PRIVATE_IPS` | `false` | Local/test escape hatch; rejected in production environments |
+| `METRICS_ENABLED` | `true` | Serve Prometheus metrics on a dedicated listener |
+| `METRICS_ADDR` | `127.0.0.1:9090` | Metrics listener address |
+| `METRICS_TOKEN` | empty | Required when `METRICS_ADDR` is not loopback |
+
+Validation rules:
+
+- `LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`.
+- `HANDLER_TIMEOUT` may exceed the lease because heartbeats keep it alive.
+- `MAX_ATTEMPTS` must be between `1` and `10`.
+- `API_REPLICAS > 1` is rejected while either in-memory rate limit is enabled.
+  Scaling the API requires a shared limiter or deliberately disabling both
+  budgets.
+- `WEBHOOK_ALLOW_PRIVATE_IPS=true` is rejected when `APP_ENV` is `production`,
+  `prod` or `live`.
+
+The total HTTP body limit is `MAX_PAYLOAD_BYTES + 64 KiB` to allow for JSON
+framing.
+
+## Observability
+
+### Health
+
+Use `/health/live` for liveness and `/health/ready` for dependency-aware
+readiness. Readiness performs a bounded database ping.
+
+### Metrics
+
+Both binaries expose Prometheus text-format metrics at `GET /metrics` on a
+dedicated listener, separate from the authenticated API router. The default
+`127.0.0.1:9090` bind is private. A routable bind requires `METRICS_TOKEN`, and
+startup fails without it. Give API and worker distinct ports when running them
+on one host.
+
+Available series include:
+
+- `api_http_requests_total{method,route,status}` and
+  `api_http_request_duration_seconds`;
+- `api_rate_limited_total{scope}`;
+- `jobs_submitted_total{job_type,result}`, `jobs_completed_total`,
+  `jobs_failed_total{job_type,class}`, `jobs_retried_total`,
+  `jobs_dead_lettered_total`, `jobs_replayed_total`, `jobs_cancelled_total`;
+- `job_attempts_total`, `job_wait_duration_seconds`,
+  `job_execution_duration_seconds`, `worker_active_count`;
+- `worker_heartbeat_failures_total`, `worker_expired_leases_total{outcome}`;
+- `jobs_queue_depth`, `jobs_oldest_due_seconds`;
+- `db_pool_in_use`, `db_pool_idle`, `db_pool_wait_count`, `db_pool_max_conns`.
+
+Metrics are process-local. Scrape every replica and keep `instance` in panel
+legends. Queue gauges are computed once in PostgreSQL but published by every
+worker, so aggregate them with `max()`, not `sum()`.
+
+Local verification:
 
 ```bash
-# Unit tests (no database required)
+curl -H 'Authorization: Bearer local-metrics-token' \
+  http://localhost:9092/metrics
+
+curl -H 'Authorization: Bearer local-metrics-token' \
+  http://localhost:9093/metrics
+
+curl -sS http://localhost:9090/api/v1/targets
+```
+
+Prometheus scrape configuration, alert rules, dashboard queries and the on-call
+runbook are in [`docs/monitoring`](docs/monitoring/README.md). The Compose stack
+loads `monitoring/prometheus/prometheus.yml`, alerts and a provisioned Grafana
+dashboard from `monitoring/grafana/`.
+
+## Security boundaries
+
+- Tenant and role come only from the authenticated API key.
+- API keys are stored as SHA-256 digests; plaintext is unrecoverable.
+- Client keys are owner-scoped for reads and cancellation.
+- Cross-tenant resources return `404`.
+- Job payloads and internal lease fields are omitted from API responses.
+- Request bodies are size-limited and decoded with unknown-field rejection.
+- Payloads are validated against the registered handler schema before storage.
+- Per-tenant outstanding quotas are enforced durably in PostgreSQL.
+- Per-tenant request budgets are in-memory and accurate for one API process.
+- Webhook egress rejects private, loopback, link-local, metadata-service,
+  multicast, reserved and documentation addresses. DNS answers are checked at
+  dial time to prevent rebinding.
+- Webhook redirects and URL credentials are rejected.
+- Non-loopback metrics listeners require a bearer token.
+- Production environments reject the private-IP webhook escape hatch.
+
+## Operations
+
+### API keys
+
+```bash
+docker compose run --rm apikey create \
+  -tenant "$TENANT_ID" -name my-client -role client
+
+docker compose run --rm apikey list -tenant "$TENANT_ID"
+
+docker compose run --rm apikey revoke \
+  -tenant "$TENANT_ID" -name my-client
+```
+
+### Submitting and inspecting work
+
+```bash
+export BASE='http://localhost:8080'
+
+RESPONSE="$(curl -sS -X POST "$BASE/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Idempotency-Key: report-$(uuidgen)" \
+  -d '{"job_type":"report.generate","payload":{"report_id":"r-1"}}')"
+
+JOB_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$RESPONSE")"
+
+curl -sS "$BASE/v1/jobs/$JOB_ID" \
+  -H "Authorization: Bearer $API_KEY" | python3 -m json.tool
+```
+
+Jobs are immutable after submission. There is no update endpoint. To change
+work, cancel the old job and submit a new one. There is no delete API; rows are
+retained as durable history. For local cleanup only, use direct PostgreSQL
+access with care.
+
+### Database inspection
+
+```bash
+docker compose exec postgres psql -U jobs -d jobs \
+  -c "SELECT id, status, attempts, locked_by, lease_token, last_error FROM jobs ORDER BY created_at DESC LIMIT 20;"
+```
+
+### Failure drills
+
+Local procedures for API restart, worker outage, expired lease recovery,
+dead-letter replay and metrics authentication are in
+[`docs/runbooks/failure-drills.md`](docs/runbooks/failure-drills.md).
+
+## Testing
+
+```bash
+# Unit tests; integration tests skip without a database URL
 go test ./...
 
 # Race detector
@@ -535,62 +1135,65 @@ go test -race ./...
 
 # PostgreSQL integration tests
 TEST_DATABASE_URL='postgres://jobs:jobs@localhost:5432/jobs?sslmode=disable' \
-  go test -v ./tests/integration
+  go test -race -count=1 ./tests/integration
+
+# Full local quality gate
+make check
 ```
 
-The integration suite verifies:
+The integration suite verifies persistence across restarts, concurrent
+idempotency, tenant isolation, API-key authentication and revocation, replay
+authorization, payload rejection, migration idempotency, atomic claims, queue
+ordering, lease fencing, retry and dead-letter behavior, worker concurrency and
+shutdown, heartbeats, recovery, cancellation, listing, quotas and queue gauges.
 
-- jobs persist across a full API and connection-pool restart;
-- concurrent-safe idempotency returns one durable row;
-- tenant isolation returns `404` for another tenant;
-- missing, malformed, unknown and revoked API keys return `401`;
-- client keys cannot replay dead jobs while operator keys can;
-- `api_keys` stores only a 32-byte SHA-256 digest;
-- invalid payloads are rejected before persistence;
-- migrations are idempotent;
-- workers claim jobs atomically across concurrent claimers;
-- priority/run-at ordering and skip rules are honoured;
-- completions and failures are fenced by the lease token;
-- handlers move jobs through success, retry and dead-letter states;
-- worker concurrency stays bounded and graceful shutdown drains in flight work;
-- heartbeats keep a long-running handler's lease alive beyond its original
-  expiry, while recovery leaves live leases alone;
-- expired leases are requeued or dead-lettered according to attempts;
-- permanent failures dead-letter immediately and transient failures schedule a
-  jittered retry;
-- replay moves a dead job back to `retry_wait`, resets attempts, records the
-  audit columns and rejects non-dead or cross-tenant jobs;
-- only operator keys can replay, and `replayed_by` records the operator key name;
-- listing paginates with an opaque cursor, applies status/type/time filters and
-  never leaks another tenant's jobs;
-- queued cancellation is immediate, running cancellation is cooperative and
-  lease-fenced, and terminal jobs return `409`;
-- recovery finalizes a pending cancellation after a lease expires;
-- outstanding quotas reject excess submissions atomically and idempotent
-  replays bypass the quota;
-- the API maps quota exhaustion to `429 quota_exceeded`;
-- queue backlog gauges match claim eligibility and use the PostgreSQL clock.
+Integration tests use throwaway PostgreSQL schemas where appropriate and skip
+when neither `TEST_DATABASE_URL` nor `DATABASE_URL` is set. CI starts a
+PostgreSQL service so the full suite runs on every push and pull request.
 
-Phase 2–3 claim and concurrency tests run in throwaway PostgreSQL schemas, so
-they do not depend on or disturb development data. Integration tests are skipped
-when no `TEST_DATABASE_URL` or `DATABASE_URL` is set. CI starts a PostgreSQL
-service container so the full integration suite runs on every push and pull
-request. The Makefile wraps the common commands as `make test`, `make test-race`
-and `make check`. Operational verification procedures are in
-[`docs/runbooks/failure-drills.md`](docs/runbooks/failure-drills.md).
+## Container delivery and CI
+
+The multi-stage `Dockerfile` builds one image per binary:
+
+```text
+ghcr.io/<owner>/durable-job-processor-api:latest
+ghcr.io/<owner>/durable-job-processor-worker:latest
+ghcr.io/<owner>/durable-job-processor-migrate:latest
+ghcr.io/<owner>/durable-job-processor-apikey:latest
+```
+
+Repository names are lowercased for GHCR. Branch, full commit SHA and `latest`
+tags are produced where applicable.
+
+GitHub Actions:
+
+- checks formatting and runs `go vet`;
+- runs unit and race tests;
+- runs PostgreSQL integration tests;
+- validates the Compose configuration;
+- builds all four images;
+- publishes images to GHCR only on pushes to `main`;
+- builds without pushing on pull requests.
+
+Build locally with:
+
+```bash
+make build
+make docker-build
+```
 
 ## Project layout
 
-```
+```text
 cmd/api/                 API entrypoint and graceful shutdown
 cmd/apikey/              API-key provisioning, listing and revocation CLI
 cmd/migrate/             Migration entrypoint
 cmd/worker/              Worker entrypoint and graceful shutdown
 internal/auth/           API-key generation, hashing, roles and authentication
 internal/config/         Environment configuration and validation
-internal/domain/         Job model, statuses, transitions, errors
+internal/domain/         Job model, statuses, transitions and errors
 internal/jobs/           Repository interface, validator and service
-internal/postgres/       Pool, migrations, repositories, transactions
+internal/postgres/       Pool, migrations, repositories and transactions
 internal/handlers/       Handler registry and built-in job handlers
 internal/queue/          Queue store contract used by the worker
 internal/retry/          Failure classification and jittered backoff policy
@@ -598,9 +1201,9 @@ internal/worker/         Claim loops, heartbeats, recovery, dispatch and shutdow
 internal/transport/http/ Router, handlers, DTOs and middleware
 migrations/              Embedded versioned SQL migrations
 tests/integration/       PostgreSQL-backed API and worker tests
-docs/architecture/       Architecture blueprint and diagrams
+docs/architecture/       Architecture design and diagrams
 docs/monitoring/         Scrape, dashboard, alert and runbook guidance
-docs/runbooks/           Failure drills for local and operational verification
+docs/runbooks/           Failure drills
 monitoring/prometheus/   Prometheus scrape config and starter alert rules
 monitoring/grafana/      Provisioned datasource and dashboard
 .github/workflows/       CI pipeline
@@ -609,20 +1212,11 @@ compose.yaml             Full local stack
 Makefile                 Common build, test and stack targets
 ```
 
-## Roadmap
+## Further documentation
 
-| Phase | Status |
-|---|---|
-| 1 — Job submission and persistence | Implemented |
-| 2 — First worker | Implemented |
-| 3 — Concurrency and bounded pool | Implemented with Phase 2 |
-| 4 — Leases, heartbeat and recovery | Implemented with Phase 3 |
-| 5 — Retry, dead-letter and replay | Implemented with Phase 3 |
-| 6 — Authentication and tenant hardening | Implemented: API keys, owner/operator authz, schema validation, listing, cancellation, quotas and separate rate limits |
-| 7 — Observability | Implemented: structured logs, health checks, Prometheus `/metrics`, queue gauges, starter alerts, runbooks and dashboard queries |
-| 8 — Containers and CI | Implemented: multi-stage images, full Compose stack, Makefile targets and GitHub Actions with PostgreSQL integration tests |
-| 9 — AWS and Terraform | Planned |
-| 10 — Kubernetes lab | Planned |
-
-The authoritative design is in
-`docs/architecture/Durable_Job_Processor_Architecture_Design.docx`.
+- [Architecture design](docs/architecture/Durable_Job_Processor_Architecture_Design.docx)
+- [Architecture diagram source](docs/architecture/Durable_Job_Processor_Architecture_Mermaid.md)
+- [Monitoring guide](docs/monitoring/README.md)
+- [Monitoring runbook](docs/monitoring/runbook.md)
+- [Failure drills](docs/runbooks/failure-drills.md)
+- [Delivery roadmap](docs/ROADMAP.md)
