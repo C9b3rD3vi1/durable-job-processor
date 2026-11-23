@@ -226,9 +226,10 @@ import.
 **Response:** confirm expected load. If legitimate, adjust
 `TENANT_RATE_LIMIT_PER_MINUTE` or `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE`
 deliberately and record the change. If abusive, block or throttle the client
-upstream. The budgets are in-memory; keep `API_REPLICAS=1` while they are
-enabled, or disable both budgets explicitly before scaling. Startup refuses the
-inconsistent combination.
+upstream. Both budgets are shared through PostgreSQL `rate_limit_counters`, so
+the totals already include every API replica. A `rate_limiter_unavailable` spike
+instead indicates the counter store is failing; check database connectivity and
+pool saturation rather than changing the budgets.
 
 ## DurableJobDBPoolSaturated
 

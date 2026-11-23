@@ -63,8 +63,8 @@ type Config struct {
 	TenantRateLimitPerMinute       int
 	TenantSubmitRateLimitPerMinute int
 
-	// APIReplicas records how many API processes share the in-memory rate
-	// limiter. Scaling beyond one requires a shared limiter implementation.
+	// APIReplicas records the declared API replica count. Rate limits use a
+	// shared PostgreSQL counter store, so any positive count is supported.
 	APIReplicas int
 
 	// Webhook egress controls. AllowedHosts is an optional allow-list; an empty
@@ -219,10 +219,6 @@ func Load() (Config, error) {
 	}
 	if cfg.APIReplicas < 1 {
 		return Config{}, fmt.Errorf("API_REPLICAS must be at least 1")
-	}
-	if cfg.APIReplicas > 1 &&
-		(cfg.TenantRateLimitPerMinute > 0 || cfg.TenantSubmitRateLimitPerMinute > 0) {
-		return Config{}, fmt.Errorf("in-memory rate limits require API_REPLICAS=1; use a shared limiter before scaling API replicas")
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be positive")

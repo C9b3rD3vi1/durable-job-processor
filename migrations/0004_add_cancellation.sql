@@ -1,4 +1,4 @@
--- Phase 6 cancellation and listing support.
+-- Cancellation and listing support.
 --
 -- cancel_requested_at records a cooperative cancellation request for a running
 -- job. The worker observes it on its next heartbeat, cancels the handler

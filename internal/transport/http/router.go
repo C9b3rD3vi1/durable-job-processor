@@ -30,6 +30,10 @@ type Options struct {
 	MaxBodyBytes             int64
 	RateLimitPerMinute       int
 	SubmitRateLimitPerMinute int
+
+	// RateLimitStore, when provided, shares counters across API processes.
+	// Without it the router falls back to process-local in-memory limiters.
+	RateLimitStore middleware.RateLimitStore
 }
 
 // NewRouter builds the HTTP handler tree.
@@ -41,10 +45,20 @@ func NewRouter(opts Options) http.Handler {
 
 	jobsHandler := handlers.NewJobsHandler(opts.JobService, logger, opts.MaxBodyBytes)
 	authenticated := middleware.RequireAuth(opts.Authenticator, logger)
+
+	// A shared store makes both budgets global across API replicas. The
+	// in-memory fallback keeps unit tests and single-process deployments
+	// independent of PostgreSQL.
+	newLimiter := func(scope string, limit int) middleware.Limiter {
+		if opts.RateLimitStore != nil {
+			return middleware.NewStoreRateLimiter(opts.RateLimitStore, scope, limit, time.Minute)
+		}
+		return middleware.NewRateLimiter(limit, time.Minute)
+	}
 	rateLimited := middleware.RateLimitWithMetrics(
-		middleware.NewRateLimiter(opts.RateLimitPerMinute, time.Minute), logger, opts.Metrics)
+		newLimiter("request", opts.RateLimitPerMinute), logger, opts.Metrics)
 	submitRateLimited := middleware.RateLimitWithMetrics(
-		middleware.NewRateLimiter(opts.SubmitRateLimitPerMinute, time.Minute), logger, opts.Metrics, "submission")
+		newLimiter("submission", opts.SubmitRateLimitPerMinute), logger, opts.Metrics, "submission")
 	// Authentication runs before the per-tenant rate limiter so the tenant is
 	// always a verified identity and unknown keys never consume a budget.
 	authorized := func(next http.Handler) http.Handler {

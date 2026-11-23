@@ -16,9 +16,10 @@ const (
 	ClassTransient
 	// ClassPermanent is a failure that retrying cannot fix.
 	ClassPermanent
-	// ClassCancelled is a failure caused by context cancellation. Until a
-	// cancellation API exists, it is retried like a transient failure so a
-	// graceful shutdown does not discard work.
+	// ClassCancelled is a failure caused by context cancellation, such as a
+	// worker shutdown interrupting a handler. It is retried like a transient
+	// failure so an interrupted attempt is not lost. Durable cooperative
+	// cancellation is finalized separately by the worker.
 	ClassCancelled
 )
 

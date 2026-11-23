@@ -37,5 +37,7 @@ flowchart TB
 ```
 
 > Build delivery (`Git Repository → GitHub Actions → registry → Docker Compose`)
-> is implemented in Phase 8. The Terraform, AWS EC2 and kind/minikube branches
-> are planned for Phases 9 and 10 and are not present yet.
+> and the local Compose runtime are represented in this repository. The
+> Terraform, AWS EC2 and kind/minikube branches are design targets only; no
+> corresponding manifests are present. See the
+> [delivery roadmap](../ROADMAP.md) for current scope.

@@ -1,4 +1,4 @@
--- Phase 3 replay audit. A replay is an operator action that returns a dead job
+-- Replay audit. A replay is an operator action that returns a dead job
 -- to retry_wait, so the durable row must retain who replayed it, when, and how
 -- many times it has been replayed.
 ALTER TABLE jobs

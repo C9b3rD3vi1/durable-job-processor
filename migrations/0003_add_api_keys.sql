@@ -1,4 +1,4 @@
--- Phase 6 API authentication. Only the SHA-256 digest of an API key is stored,
+-- API authentication. Only the SHA-256 digest of an API key is stored,
 -- so a database reader cannot recover a usable credential. Tenant and role are
 -- derived from the authenticated key, never from a caller-supplied header.
 CREATE TABLE api_keys (

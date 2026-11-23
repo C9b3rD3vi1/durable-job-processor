@@ -24,9 +24,9 @@ import (
 )
 
 // mustIsolatedPool creates a throwaway PostgreSQL schema and returns a pool
-// whose search_path points at it. Phase 2 claim tests operate on the whole
+// whose search_path points at it. Claim and recovery tests operate on the whole
 // table, so schema isolation keeps them independent from development data and
-// from the Phase 1 integration suite.
+// from the HTTP integration suite.
 func mustIsolatedPool(t *testing.T, databaseURL string) *pgxpool.Pool {
 	t.Helper()
 

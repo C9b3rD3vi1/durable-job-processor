@@ -54,7 +54,9 @@ func run() error {
 	}
 	defer pool.Close()
 	logger.Info("database connected", "max_conns", cfg.DBMaxConns)
-	logger.Info("rate limiter configured", "backend", "memory", "api_replicas", cfg.APIReplicas)
+
+	rateLimitStore := postgres.NewRateLimitRepository(pool)
+	logger.Info("rate limiter configured", "backend", "postgres", "api_replicas", cfg.APIReplicas)
 
 	if cfg.AutoMigrate {
 		applied, err := postgres.Migrate(ctx, pool, migrations.FS)
@@ -84,6 +86,7 @@ func run() error {
 		MaxBodyBytes:             cfg.RequestBodyLimit(),
 		RateLimitPerMinute:       cfg.TenantRateLimitPerMinute,
 		SubmitRateLimitPerMinute: cfg.TenantSubmitRateLimitPerMinute,
+		RateLimitStore:           rateLimitStore,
 	})
 
 	server := &http.Server{
@@ -122,6 +125,7 @@ func run() error {
 		serverErr <- server.ListenAndServe()
 	}()
 
+	metricsStopped := false
 	select {
 	case err := <-serverErr:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -129,7 +133,13 @@ func run() error {
 		}
 		return fmt.Errorf("serve HTTP: %w", err)
 	case err := <-metricsErr:
-		return fmt.Errorf("metrics server: %w", err)
+		if err != nil {
+			return fmt.Errorf("metrics server: %w", err)
+		}
+		// ServeMetrics returns nil only after ctx is cancelled. Fall through to
+		// the normal shutdown path instead of wrapping a nil error.
+		metricsStopped = true
+		logger.Info("metrics listener stopped", "addr", cfg.MetricsAddr)
 	case <-ctx.Done():
 		logger.Info("shutdown requested", "timeout", cfg.ShutdownTimeout.String())
 	}
@@ -143,7 +153,7 @@ func run() error {
 	if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("serve HTTP: %w", err)
 	}
-	if cfg.MetricsEnabled {
+	if cfg.MetricsEnabled && !metricsStopped {
 		if err := <-metricsErr; err != nil {
 			return fmt.Errorf("metrics server: %w", err)
 		}

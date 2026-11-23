@@ -71,13 +71,13 @@ Implemented capabilities include:
 - bounded worker concurrency with atomic claims;
 - expiring leases, heartbeats and lease-token fencing;
 - full-jitter exponential backoff, dead-lettering and audited replay;
-- per-tenant quotas and in-memory rate limits;
+- per-tenant quotas and shared PostgreSQL-backed rate limits;
 - SSRF-hardened webhook delivery;
 - structured logs, health probes and Prometheus metrics;
 - multi-stage container images, a Compose stack and CI.
 
 Not included in this repository: a job-management web UI, job update/delete API,
-distributed rate limiting, AWS/Terraform deployment and a Kubernetes lab. See
+AWS/Terraform deployment and a Kubernetes lab. See
 [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Quick start
@@ -619,6 +619,7 @@ Common error codes:
 | `invalid_transition` | `409` | Job state does not allow the operation |
 | `quota_exceeded` | `429` | Tenant outstanding-job quota reached |
 | `rate_limited` | `429` | General or submission rate limit reached |
+| `rate_limiter_unavailable` | `503` | Shared rate-limit store could not be reached; the request is denied |
 | `internal_error` | `500` | Unexpected server error |
 
 ### `POST /v1/jobs`
@@ -937,6 +938,21 @@ Constraints and indexes enforce:
 `created_at` and `revoked_at`. Names are unique per tenant. Roles are constrained
 to `client` and `operator`.
 
+### `rate_limit_counters`
+
+`rate_limit_counters` stores one shared fixed-window counter per `(scope,
+tenant_id)` pair. The scopes are `request` for general API traffic and
+`submission` for job creation. Each row records `window_start`, `count` and
+`updated_at`.
+
+Every API process updates the same row with an atomic PostgreSQL upsert, so a
+tenant's budget is global rather than per-process. A counter resets when the
+stored window start is older than the current minute. The counter is capped at
+`limit + 1`, so rejected requests do not grow it without bound. Rows are keyed
+by tenant and scope rather than by request, so table growth tracks active
+tenants rather than traffic; the `updated_at` index supports manual cleanup of
+inactive tenants.
+
 ### Migrations
 
 | Migration | Purpose |
@@ -946,6 +962,7 @@ to `client` and `operator`.
 | `0003_add_api_keys.sql` | API key table, role and hash constraints |
 | `0004_add_cancellation.sql` | Cancellation timestamp and listing index |
 | `0005_add_job_owner.sql` | Creator attribution and tenant/owner index |
+| `0006_create_rate_limit_counters.sql` | Shared rate-limit counter table and cleanup index |
 
 Applied versions are tracked in `schema_migrations`. An advisory lock prevents
 concurrent migration runs from racing.
@@ -986,7 +1003,7 @@ startup.
 | `TENANT_MAX_OUTSTANDING_JOBS` | `1000` | `queued`/`running`/`retry_wait` jobs per tenant; `0` disables |
 | `TENANT_RATE_LIMIT_PER_MINUTE` | `600` | Per-tenant API requests per fixed minute; `0` disables |
 | `TENANT_SUBMIT_RATE_LIMIT_PER_MINUTE` | `120` | Additional per-tenant submit budget per fixed minute; `0` disables |
-| `API_REPLICAS` | `1` | Declared API replica count; see rate-limit constraint below |
+| `API_REPLICAS` | `1` | Declared API replica count; informational, does not change limiter behavior |
 | `WEBHOOK_ALLOWED_HOSTS` | empty | Comma-separated destination allow-list; leading `.` permits subdomains |
 | `WEBHOOK_ALLOW_PRIVATE_IPS` | `false` | Local/test escape hatch; rejected in production environments |
 | `METRICS_ENABLED` | `true` | Serve Prometheus metrics on a dedicated listener |
@@ -998,14 +1015,33 @@ Validation rules:
 - `LEASE_DURATION` must be greater than `HEARTBEAT_INTERVAL`.
 - `HANDLER_TIMEOUT` may exceed the lease because heartbeats keep it alive.
 - `MAX_ATTEMPTS` must be between `1` and `10`.
-- `API_REPLICAS > 1` is rejected while either in-memory rate limit is enabled.
-  Scaling the API requires a shared limiter or deliberately disabling both
-  budgets.
+- `API_REPLICAS` must be at least `1`. Any positive value is accepted because
+  both rate-limit budgets use shared PostgreSQL counters and remain correct
+  across API replicas.
 - `WEBHOOK_ALLOW_PRIVATE_IPS=true` is rejected when `APP_ENV` is `production`,
   `prod` or `live`.
 
 The total HTTP body limit is `MAX_PAYLOAD_BYTES + 64 KiB` to allow for JSON
 framing.
+
+### Rate limiting
+
+Authentication runs before rate limiting, so budgets are keyed by the tenant of
+the verified API key and unknown keys never consume capacity. Two independent
+fixed-minute budgets are enforced:
+
+- `request` applies to all authenticated `/v1` routes;
+- `submission` applies only to `POST /v1/jobs`, in addition to the general
+  budget.
+
+A submission checks the submission budget first, so an exhausted submit budget
+does not consume general request capacity. Both counters live in PostgreSQL and
+are updated atomically, so the limits apply to the whole deployment rather than
+to individual API processes. A `0` budget disables that scope.
+
+A rejected request returns `429 rate_limited` with a `Retry-After` header. If the
+counter store cannot be reached, the API denies the request with `503
+rate_limiter_unavailable` rather than silently allowing traffic past the budget.
 
 ## Observability
 
@@ -1067,7 +1103,8 @@ dashboard from `monitoring/grafana/`.
 - Request bodies are size-limited and decoded with unknown-field rejection.
 - Payloads are validated against the registered handler schema before storage.
 - Per-tenant outstanding quotas are enforced durably in PostgreSQL.
-- Per-tenant request budgets are in-memory and accurate for one API process.
+- Per-tenant request budgets are shared through PostgreSQL and remain accurate
+  across API replicas.
 - Webhook egress rejects private, loopback, link-local, metadata-service,
   multicast, reserved and documentation addresses. DNS answers are checked at
   dial time to prevent rebinding.

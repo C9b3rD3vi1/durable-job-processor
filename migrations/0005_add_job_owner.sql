@@ -1,4 +1,4 @@
--- Phase 4 authorization: attribute each job to the API key that submitted it.
+-- Authorization: attribute each job to the API key that submitted it.
 --
 -- NULL means a legacy or directly inserted job with no recorded creator. Such
 -- jobs remain visible and cancellable to authenticated members of the tenant so

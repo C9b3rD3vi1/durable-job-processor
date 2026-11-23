@@ -21,7 +21,7 @@ const (
 // Job is the durable representation of a unit of work.
 //
 // Lease and execution fields are present so the repository can round-trip every
-// column, even though Phase 1 only creates and reads queued jobs.
+// column used by claiming, execution, recovery and replay.
 type Job struct {
 	ID             uuid.UUID       `json:"id"`
 	TenantID       uuid.UUID       `json:"tenant_id"`
