@@ -310,7 +310,7 @@ func TestLoadWebhookEgressDefaults(t *testing.T) {
 }
 
 func TestLoadRejectsPrivateWebhookIPsInProduction(t *testing.T) {
-	for _, environment := range []string{"production", "PROD", " live ", "prod-us-1", "us.production", "prd"} {
+	for _, environment := range []string{"production", "PROD", " live ", "prod-us-1", "us.production", "prd", "prod2", "productionish", "live1"} {
 		t.Run(environment, func(t *testing.T) {
 			setBaseEnv(t)
 			t.Setenv("APP_ENV", environment)
@@ -334,6 +334,16 @@ func TestLoadAllowsPrivateWebhookIPsOutsideProduction(t *testing.T) {
 	}
 	if !cfg.WebhookAllowPrivateIPs {
 		t.Error("WebhookAllowPrivateIPs = false, want true")
+	}
+}
+
+func TestLoadRejectsPrivateWebhookIPsInUnknownEnvironment(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("APP_ENV", "staging")
+	t.Setenv("WEBHOOK_ALLOW_PRIVATE_IPS", "true")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want private webhook IPs rejected outside an explicit development environment")
 	}
 }
 

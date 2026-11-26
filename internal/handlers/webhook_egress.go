@@ -85,7 +85,9 @@ func (p WebhookEgressPolicy) allowsIP(ip net.IP) bool {
 		ip = v4
 	}
 	if p.AllowPrivateIPs {
-		return true
+		// The development escape hatch relaxes range checks, but never permits
+		// addresses that cannot represent a concrete peer.
+		return !ip.IsUnspecified() && !ip.IsMulticast() && !ip.IsInterfaceLocalMulticast()
 	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||

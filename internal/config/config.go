@@ -236,6 +236,9 @@ func Load() (Config, error) {
 	if cfg.WebhookAllowPrivateIPs && isProductionEnvironment(cfg.Environment) {
 		return Config{}, fmt.Errorf("WEBHOOK_ALLOW_PRIVATE_IPS must be false when APP_ENV is production")
 	}
+	if cfg.WebhookAllowPrivateIPs && !isDevelopmentEnvironment(cfg.Environment) {
+		return Config{}, fmt.Errorf("WEBHOOK_ALLOW_PRIVATE_IPS requires APP_ENV to explicitly identify a development environment")
+	}
 	for _, host := range cfg.WebhookAllowedHosts {
 		if !validWebhookHost(host) {
 			return Config{}, fmt.Errorf("WEBHOOK_ALLOWED_HOSTS contains invalid hostname %q", host)
@@ -297,11 +300,33 @@ func loopbackHost(host string) bool {
 func isProductionEnvironment(env string) bool {
 	normalised := strings.ToLower(strings.TrimSpace(env))
 	tokens := strings.FieldsFunc(normalised, func(r rune) bool {
-		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
 	})
 	for _, token := range tokens {
 		switch token {
 		case "production", "prod", "prd", "live":
+			return true
+		}
+		// Catch production-like suffixes such as prod2, prd3 and live-us
+		// even when they arrive as a single token.
+		if strings.HasPrefix(token, "production") || strings.HasPrefix(token, "prod") ||
+			strings.HasPrefix(token, "prd") || strings.HasPrefix(token, "live") {
+			return true
+		}
+	}
+	return false
+}
+
+// isDevelopmentEnvironment requires an explicit non-production environment
+// token before the private-IP webhook escape hatch may be enabled. Unknown and
+// empty values fail closed rather than silently relaxing egress controls.
+func isDevelopmentEnvironment(env string) bool {
+	tokens := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(env)), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	})
+	for _, token := range tokens {
+		switch token {
+		case "development", "dev", "local", "test", "testing":
 			return true
 		}
 	}

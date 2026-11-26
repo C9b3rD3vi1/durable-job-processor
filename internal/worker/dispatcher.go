@@ -86,8 +86,7 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 	if !job.CreatedAt.IsZero() && started.After(job.CreatedAt) {
 		r.metrics.Observe(observability.MetricJobWaitDuration, started.Sub(job.CreatedAt).Seconds(), jobType)
 	}
-	result, err := invokeHandlerBounded(handlerCtx, handler, *job)
-	timedOut := errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
+	result, err, timedOut := invokeHandlerBoundedResult(handlerCtx, handler, *job)
 	elapsed := time.Since(started)
 	r.metrics.Observe(observability.MetricJobExecutionDuration, elapsed.Seconds(), jobType)
 
@@ -131,7 +130,7 @@ func (r *Runner) process(ctx context.Context, job *domain.Job) {
 		return
 	}
 
-	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), r.persistTimeout)
 	defer cancelPersist()
 
 	completed, completeErr := r.store.CompleteJob(persistCtx, job.ID, *job.LeaseToken, result)
@@ -176,7 +175,7 @@ func (r *Runner) heartbeat(ctx context.Context, job *domain.Job, onLost, onCance
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			heartbeatCtx, cancel := context.WithTimeout(ctx, persistTimeout)
+			heartbeatCtx, cancel := context.WithTimeout(ctx, r.persistTimeout)
 			result, err := r.store.HeartbeatJob(heartbeatCtx, job.ID, *job.LeaseToken, r.leaseDuration)
 			cancel()
 			if err != nil {
@@ -207,7 +206,7 @@ func (r *Runner) heartbeat(ctx context.Context, job *domain.Job, onLost, onCance
 // a cancellation request landed first. It returns true when the job was
 // durably marked cancelled.
 func (r *Runner) cancelledAfterWrite(ctx context.Context, job *domain.Job, logger *slog.Logger) bool {
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.persistTimeout)
 	defer cancel()
 
 	cancelled, err := r.store.CancelRunningJob(persistCtx, job.ID, *job.LeaseToken)
@@ -228,7 +227,7 @@ func (r *Runner) cancelledAfterWrite(ctx context.Context, job *domain.Job, logge
 // returns false when the lease is no longer current or cancellation won the
 // race, so the caller can try to finalize a cancellation instead.
 func (r *Runner) fail(ctx context.Context, job *domain.Job, logger *slog.Logger, cause error, retryDelay time.Duration) bool {
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.persistTimeout)
 	defer cancel()
 
 	message := truncateError(cause.Error())
@@ -266,6 +265,14 @@ type handlerOutcome struct {
 // ignores cancellation. The handler goroutine may outlive the runner, so the
 // result channel is buffered; process exit reclaims any abandoned goroutine.
 func invokeHandlerBounded(ctx context.Context, handler handlers.Handler, job domain.Job) (json.RawMessage, error) {
+	result, err, _ := invokeHandlerBoundedResult(ctx, handler, job)
+	return result, err
+}
+
+// invokeHandlerBoundedResult also reports which side of the bounded select won.
+// A handler that finishes as its context expires must keep its own result
+// instead of being reclassified as a runner timeout.
+func invokeHandlerBoundedResult(ctx context.Context, handler handlers.Handler, job domain.Job) (json.RawMessage, error, bool) {
 	done := make(chan handlerOutcome, 1)
 	go func() {
 		result, err := invokeHandler(ctx, handler, job)
@@ -274,9 +281,9 @@ func invokeHandlerBounded(ctx context.Context, handler handlers.Handler, job dom
 
 	select {
 	case outcome := <-done:
-		return outcome.result, outcome.err
+		return outcome.result, outcome.err, false
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, ctx.Err(), errors.Is(ctx.Err(), context.DeadlineExceeded)
 	}
 }
 

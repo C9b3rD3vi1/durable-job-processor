@@ -164,7 +164,6 @@ func run() error {
 	if !serverStopped {
 		select {
 		case err := <-serverErr:
-			serverStopped = true
 			if err != nil && !errors.Is(err, http.ErrServerClosed) {
 				addErr(fmt.Errorf("serve HTTP: %w", err))
 			}
@@ -175,7 +174,6 @@ func run() error {
 	if metricsEnabled && !metricsStopped {
 		select {
 		case err := <-metricsCh:
-			metricsStopped = true
 			if err != nil {
 				addErr(fmt.Errorf("metrics server: %w", err))
 			} else {

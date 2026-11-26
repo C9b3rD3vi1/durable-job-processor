@@ -70,6 +70,24 @@ func NewRouter(opts Options) http.Handler {
 	submissionAuthorized := func(next http.Handler) http.Handler {
 		return authenticated(submitRateLimited(rateLimited(next)))
 	}
+
+	// Method-specific patterns fall through to the catch-all on a mismatch.
+	// A path-only mux lets the catch-all answer with 405 and a correct Allow
+	// header instead of reporting an existing route as not found.
+	methodAllowances := map[string]string{
+		"/v1/jobs":             "GET, POST",
+		"/v1/jobs/{id}":        "GET",
+		"/v1/jobs/{id}/cancel": "POST",
+		"/v1/jobs/{id}/replay": "POST",
+		"/health/live":         "GET",
+		"/health/ready":        "GET",
+	}
+	pathMux := http.NewServeMux()
+	for pattern := range methodAllowances {
+		pathMux.HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
+	}
+	pathMux.HandleFunc("/", func(http.ResponseWriter, *http.Request) {})
+
 	mux := http.NewServeMux()
 
 	mux.Handle("POST /v1/jobs", submissionAuthorized(http.HandlerFunc(jobsHandler.CreateJob)))
@@ -99,6 +117,14 @@ func NewRouter(opts Options) http.Handler {
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		_, pathPattern := pathMux.Handler(r)
+		if allow, ok := methodAllowances[pathPattern]; ok {
+			w.Header().Set("Allow", allow)
+			writeJSON(w, http.StatusMethodNotAllowed, dto.ErrorResponse{
+				Error: dto.ErrorBody{Code: "method_not_allowed", Message: "method not allowed for route"},
+			})
+			return
+		}
 		writeJSON(w, http.StatusNotFound, dto.ErrorResponse{
 			Error: dto.ErrorBody{Code: "not_found", Message: "route not found"},
 		})

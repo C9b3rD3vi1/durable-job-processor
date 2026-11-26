@@ -338,6 +338,12 @@ func TestNewDefaultsAndValidation(t *testing.T) {
 	if runner.recoveryInterval != defaultRecoveryInterval {
 		t.Errorf("recovery interval = %v, want %v", runner.recoveryInterval, defaultRecoveryInterval)
 	}
+	if runner.persistTimeout != defaultPersistTimeout {
+		t.Errorf("persist timeout = %v, want %v", runner.persistTimeout, defaultPersistTimeout)
+	}
+	if runner.metrics == nil {
+		t.Error("metrics = nil, want a default registry")
+	}
 
 	tests := []struct {
 		name string
@@ -1000,8 +1006,8 @@ func TestRunGracefulShutdownDrainsInFlight(t *testing.T) {
 
 	cancel()
 	select {
-	case <-done:
-		t.Fatal("Run() returned before the in-flight handler drained")
+	case err := <-done:
+		t.Fatalf("Run() returned before the in-flight handler drained: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 

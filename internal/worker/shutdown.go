@@ -2,15 +2,22 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
+
+// ErrShutdownIncomplete indicates that the final persistence grace period
+// expired before in-flight handlers finished. Callers can use it to distinguish
+// a clean drain from an abandoned handler.
+var ErrShutdownIncomplete = errors.New("worker shutdown incomplete: in-flight handlers abandoned")
 
 // Run starts the configured number of claim loops and blocks until ctx is
 // cancelled. Loops stop claiming immediately; in-flight handlers may finish for
 // up to ShutdownTimeout. After that their contexts are cancelled and the runner
 // waits one final bounded grace period for fenced persistence writes. Handlers
-// that ignore cancellation are abandoned rather than blocking shutdown.
+// that ignore cancellation are abandoned rather than blocking shutdown; if the
+// grace period expires, Run returns ErrShutdownIncomplete.
 func (r *Runner) Run(ctx context.Context) error {
 	// Handler contexts deliberately outlive the signal context so a graceful
 	// shutdown can drain work already in progress.
@@ -76,17 +83,18 @@ func (r *Runner) Run(ctx context.Context) error {
 		// Give fenced persistence writes a bounded final grace period. A
 		// handler that ignores cancellation has already been abandoned by
 		// invokeHandlerBounded, so waiting forever would serve no purpose.
-		finalTimer := time.NewTimer(persistTimeout)
+		finalTimer := time.NewTimer(r.persistTimeout)
 		defer finalTimer.Stop()
 		select {
 		case <-drained:
 			r.logger.Info("worker stopped after forced cancellation", "worker_id", r.workerID)
+			return nil
 		case <-finalTimer.C:
 			r.logger.Warn("worker shutdown grace exceeded; abandoning in-flight handlers",
 				"worker_id", r.workerID,
-				"grace", persistTimeout.String(),
+				"grace", r.persistTimeout.String(),
 			)
+			return ErrShutdownIncomplete
 		}
-		return nil
 	}
 }

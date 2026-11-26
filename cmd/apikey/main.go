@@ -167,19 +167,23 @@ func runList(args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tNAME\tROLE\tCREATED\tREVOKED")
+	if _, err := fmt.Fprintln(w, "ID\tNAME\tROLE\tCREATED\tREVOKED"); err != nil {
+		return err
+	}
 	for _, key := range keys {
 		revoked := "-"
 		if key.RevokedAt != nil {
 			revoked = key.RevokedAt.UTC().Format(time.RFC3339)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 			key.ID,
 			key.Name,
 			key.Role,
 			key.CreatedAt.UTC().Format(time.RFC3339),
 			revoked,
-		)
+		); err != nil {
+			return err
+		}
 	}
 	return w.Flush()
 }

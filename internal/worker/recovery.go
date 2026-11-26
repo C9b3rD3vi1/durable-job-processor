@@ -28,7 +28,7 @@ func (r *Runner) recoveryLoop(ctx context.Context) {
 // recoverExpired performs one bounded recovery pass and logs the outcome.
 // Errors are not fatal: the next pass retries, and claim loops keep running.
 func (r *Runner) recoverExpired(ctx context.Context) {
-	recoverCtx, cancel := context.WithTimeout(ctx, persistTimeout)
+	recoverCtx, cancel := context.WithTimeout(ctx, r.persistTimeout)
 	defer cancel()
 
 	result, err := r.store.RecoverExpiredJobs(recoverCtx, recoveryBatch)

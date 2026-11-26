@@ -175,7 +175,7 @@ func TestServeMetricsReturnsBindError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve port: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	if err := ServeMetrics(context.Background(), listener.Addr().String(), "", NewMetrics()); err == nil {
 		t.Fatal("ServeMetrics() error = nil, want bind conflict error")

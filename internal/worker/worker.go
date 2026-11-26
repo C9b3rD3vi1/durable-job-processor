@@ -31,10 +31,10 @@ const (
 	defaultRecoveryInterval  = 30 * time.Second
 	defaultShutdownTimeout   = 15 * time.Second
 
-	claimTimeout   = 10 * time.Second
-	persistTimeout = 10 * time.Second
-	maxErrorLength = 2000
-	recoveryBatch  = 100
+	claimTimeout          = 10 * time.Second
+	defaultPersistTimeout = 10 * time.Second
+	maxErrorLength        = 2000
+	recoveryBatch         = 100
 )
 
 // Config configures a Runner. Store, Registry and WorkerID are required; the
@@ -72,6 +72,7 @@ type Runner struct {
 	retryPolicy       retry.Policy
 	recoveryInterval  time.Duration
 	shutdownTimeout   time.Duration
+	persistTimeout    time.Duration
 	jitter            func() float64
 }
 
@@ -123,12 +124,16 @@ func New(cfg Config) (*Runner, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	metrics := cfg.Metrics
+	if metrics == nil {
+		metrics = observability.NewMetrics()
+	}
 
 	return &Runner{
 		store:             cfg.Store,
 		registry:          cfg.Registry,
 		logger:            logger,
-		metrics:           cfg.Metrics,
+		metrics:           metrics,
 		workerID:          strings.TrimSpace(cfg.WorkerID),
 		concurrency:       cfg.Concurrency,
 		pollInterval:      cfg.PollInterval,
@@ -139,6 +144,7 @@ func New(cfg Config) (*Runner, error) {
 		retryPolicy:       retry.NewPolicy(cfg.RetryBaseDelay, cfg.RetryMaxDelay),
 		recoveryInterval:  cfg.RecoveryInterval,
 		shutdownTimeout:   cfg.ShutdownTimeout,
+		persistTimeout:    defaultPersistTimeout,
 		jitter:            rand.Float64,
 	}, nil
 }

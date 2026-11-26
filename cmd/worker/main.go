@@ -137,11 +137,9 @@ func run() error {
 	}
 
 	if !runnerStopped {
-		runnerStopped = true
 		addErr(<-runnerErr)
 	}
 	if metricsEnabled && !metricsStopped {
-		metricsStopped = true
 		addErr(<-metricsCh)
 	}
 	if runErr != nil {

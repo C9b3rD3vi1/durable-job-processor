@@ -936,3 +936,50 @@ func TestNotFound(t *testing.T) {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
+
+func TestMethodNotAllowed(t *testing.T) {
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(uuid.New()))
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		allow  string
+	}{
+		{"jobs collection", http.MethodPut, "/v1/jobs", "GET, POST"},
+		{"job detail", http.MethodDelete, "/v1/jobs/" + uuid.New().String(), "GET"},
+		{"cancel", http.MethodGet, "/v1/jobs/" + uuid.New().String() + "/cancel", "POST"},
+		{"replay", http.MethodPut, "/v1/jobs/" + uuid.New().String() + "/replay", "POST"},
+		{"liveness", http.MethodPost, "/health/live", "GET"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(tt.method, tt.path, nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405", rec.Code)
+			}
+			if got := rec.Header().Get("Allow"); got != tt.allow {
+				t.Errorf("Allow = %q, want %q", got, tt.allow)
+			}
+			var response dto.ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.Error.Code != "method_not_allowed" {
+				t.Errorf("error code = %q, want method_not_allowed", response.Error.Code)
+			}
+		})
+	}
+}
+
+func TestUnknownRouteRemainsNotFoundForAnyMethod(t *testing.T) {
+	router := testRouter(&fakeService{}, fakePinger{}, 1<<20, testAuthenticator(uuid.New()))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/nope", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if got := rec.Header().Get("Allow"); got != "" {
+		t.Errorf("Allow = %q, want empty", got)
+	}
+}

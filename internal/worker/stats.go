@@ -28,7 +28,7 @@ func (r *Runner) statsLoop(ctx context.Context) {
 }
 
 func (r *Runner) publishQueueStats(ctx context.Context) {
-	statsCtx, cancel := context.WithTimeout(ctx, persistTimeout)
+	statsCtx, cancel := context.WithTimeout(ctx, r.persistTimeout)
 	defer cancel()
 
 	stats, err := r.store.QueueStats(statsCtx)

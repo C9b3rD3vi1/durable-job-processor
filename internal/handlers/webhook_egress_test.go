@@ -42,6 +42,32 @@ func TestWebhookEgressBlocksNonPublicLiteralAddresses(t *testing.T) {
 	}
 }
 
+func TestWebhookEgressAllowPrivateIPsStillRejectsNonPeerAddresses(t *testing.T) {
+	policy := WebhookEgressPolicy{AllowPrivateIPs: true}
+	for _, address := range []string{"0.0.0.0", "::", "224.0.0.1", "ff02::1"} {
+		t.Run(address, func(t *testing.T) {
+			ip := net.ParseIP(address)
+			if ip == nil {
+				t.Fatalf("ParseIP(%q) = nil", address)
+			}
+			if policy.allowsIP(ip) {
+				t.Fatalf("allowsIP(%s) = true, want false for a non-peer address", address)
+			}
+		})
+	}
+	for _, address := range []string{"127.0.0.1", "10.1.2.3", "::1"} {
+		t.Run(address, func(t *testing.T) {
+			ip := net.ParseIP(address)
+			if ip == nil {
+				t.Fatalf("ParseIP(%q) = nil", address)
+			}
+			if !policy.allowsIP(ip) {
+				t.Fatalf("allowsIP(%s) = false, want true with AllowPrivateIPs", address)
+			}
+		})
+	}
+}
+
 func TestWebhookEgressChecksResolvedAddressesAtDialTime(t *testing.T) {
 	// The hostname passes structural validation, but the DNS answer points at
 	// the metadata service. Rebinding after submission is blocked the same way.
