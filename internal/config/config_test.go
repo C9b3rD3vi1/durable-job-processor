@@ -253,6 +253,48 @@ func TestLoadWebhookEgressConfig(t *testing.T) {
 	}
 }
 
+func TestLoadValidatesWebhookAllowedHosts(t *testing.T) {
+	valid := []string{
+		"hooks.example.com",
+		".internal.example.org",
+		"HOOKS.EXAMPLE.COM.",
+		"a-b.example123.com",
+	}
+	for _, host := range valid {
+		t.Run("valid/"+host, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("WEBHOOK_ALLOWED_HOSTS", host)
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want %q accepted", err, host)
+			}
+			if len(cfg.WebhookAllowedHosts) != 1 {
+				t.Fatalf("WebhookAllowedHosts = %v, want one entry", cfg.WebhookAllowedHosts)
+			}
+		})
+	}
+
+	invalid := []string{
+		"*.example.com",
+		"http://example.com",
+		"bad_host",
+		"-bad.example.com",
+		"bad-.example.com",
+		"127.0.0.1",
+		"example.com:443",
+		".",
+	}
+	for _, host := range invalid {
+		t.Run("invalid/"+host, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("WEBHOOK_ALLOWED_HOSTS", host)
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil, want %q rejected", host)
+			}
+		})
+	}
+}
+
 func TestLoadWebhookEgressDefaults(t *testing.T) {
 	setBaseEnv(t)
 	cfg, err := config.Load()
@@ -268,7 +310,7 @@ func TestLoadWebhookEgressDefaults(t *testing.T) {
 }
 
 func TestLoadRejectsPrivateWebhookIPsInProduction(t *testing.T) {
-	for _, environment := range []string{"production", "PROD", " live "} {
+	for _, environment := range []string{"production", "PROD", " live ", "prod-us-1", "us.production", "prd"} {
 		t.Run(environment, func(t *testing.T) {
 			setBaseEnv(t)
 			t.Setenv("APP_ENV", environment)

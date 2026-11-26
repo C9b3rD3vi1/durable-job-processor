@@ -236,6 +236,11 @@ func Load() (Config, error) {
 	if cfg.WebhookAllowPrivateIPs && isProductionEnvironment(cfg.Environment) {
 		return Config{}, fmt.Errorf("WEBHOOK_ALLOW_PRIVATE_IPS must be false when APP_ENV is production")
 	}
+	for _, host := range cfg.WebhookAllowedHosts {
+		if !validWebhookHost(host) {
+			return Config{}, fmt.Errorf("WEBHOOK_ALLOWED_HOSTS contains invalid hostname %q", host)
+		}
+	}
 	if cfg.MetricsEnabled {
 		if err := validateListenAddr("METRICS_ADDR", cfg.MetricsAddr); err != nil {
 			return Config{}, err
@@ -286,14 +291,58 @@ func loopbackHost(host string) bool {
 }
 
 // isProductionEnvironment identifies environments where the webhook
-// private-IP escape hatch must never be enabled.
+// private-IP escape hatch must never be enabled. Recognising production-like
+// tokens (for example "prod-us-1" or "us.production") avoids a one-word
+// misconfiguration silently relaxing egress controls.
 func isProductionEnvironment(env string) bool {
-	switch strings.ToLower(strings.TrimSpace(env)) {
-	case "production", "prod", "live":
-		return true
-	default:
+	normalised := strings.ToLower(strings.TrimSpace(env))
+	tokens := strings.FieldsFunc(normalised, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	})
+	for _, token := range tokens {
+		switch token {
+		case "production", "prod", "prd", "live":
+			return true
+		}
+	}
+	return false
+}
+
+// validWebhookHost accepts exact DNS hostnames and the documented leading-dot
+// suffix form for subdomains. Literal IPs and malformed patterns are rejected
+// because the webhook policy describes hostnames, not network destinations.
+func validWebhookHost(value string) bool {
+	host := strings.TrimSpace(value)
+	suffix := false
+	if strings.HasPrefix(host, ".") {
+		suffix = true
+		host = host[1:]
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 || strings.ContainsAny(host, ":/@?") {
 		return false
 	}
+	if net.ParseIP(host) != nil {
+		return false
+	}
+
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') || char == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return !suffix || len(labels) > 1
 }
 
 // envStringList parses a comma-separated environment variable into trimmed,
