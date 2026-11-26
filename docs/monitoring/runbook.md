@@ -127,7 +127,7 @@ another worker.
 
 ```promql
 sum(rate(worker_heartbeat_failures_total[10m]))
-sum(increase(worker_expired_leases_total[outcome="dead"][30m]))
+sum(increase(worker_expired_leases_total{outcome="dead"}[30m]))
 max(db_pool_in_use / clamp_min(db_pool_max_conns, 1))
 ```
 
