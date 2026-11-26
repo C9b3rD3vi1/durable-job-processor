@@ -39,6 +39,37 @@ func TestMetricsExposition(t *testing.T) {
 	}
 }
 
+func TestMetricsIgnoreKindMismatches(t *testing.T) {
+	m := NewMetrics()
+	m.Inc(MetricJobExecutionDuration)
+	m.Add(MetricJobExecutionDuration, 2)
+	m.Set(MetricJobsCompletedTotal, 4)
+	m.Observe(MetricJobsSubmittedTotal, 0.5)
+
+	prefixes := []string{
+		MetricJobExecutionDuration + "{",
+		MetricJobExecutionDuration + "_bucket{",
+		MetricJobExecutionDuration + "_sum",
+		MetricJobExecutionDuration + "_count",
+		MetricJobsCompletedTotal + "{",
+		MetricJobsCompletedTotal + " ",
+		MetricJobsSubmittedTotal + "{",
+		MetricJobsSubmittedTotal + " ",
+	}
+	for _, line := range strings.Split(m.render(), "\n") {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(line, prefix) {
+				t.Errorf("mismatched call produced sample %q", line)
+			}
+		}
+	}
+
+	m.Observe(MetricJobExecutionDuration, 0.1)
+	if got := m.render(); !strings.Contains(got, "job_execution_duration_seconds_count 1") {
+		t.Errorf("valid observation was lost after rejected mismatches:\n%s", got)
+	}
+}
+
 func TestMetricsLabelEscapingAndOrdering(t *testing.T) {
 	m := NewMetrics()
 	m.Inc(MetricRateLimitedTotal, L("scope", `sub"mission\test`+"\nnext"), L("alpha", "z"))

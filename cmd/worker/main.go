@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -85,8 +86,11 @@ func run() error {
 		return fmt.Errorf("create worker: %w", err)
 	}
 
+	metricsEnabled := cfg.MetricsEnabled
 	metricsErr := make(chan error, 1)
-	if cfg.MetricsEnabled {
+	var metricsCh <-chan error
+	if metricsEnabled {
+		metricsCh = metricsErr
 		go func() {
 			metricsErr <- observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics)
 		}()
@@ -107,17 +111,44 @@ func run() error {
 		runnerErr <- runner.Run(ctx)
 	}()
 
-	select {
-	case err := <-metricsErr:
+	metricsStopped := false
+	runnerStopped := false
+	var runErr error
+	addErr := func(err error) {
 		if err != nil {
-			return fmt.Errorf("metrics server: %w", err)
+			runErr = errors.Join(runErr, err)
 		}
-		// A clean metrics shutdown happens during signal-driven worker
-		// shutdown; wait for the runner to finish draining.
-		return <-runnerErr
-	case err := <-runnerErr:
-		return err
 	}
+
+	select {
+	case err := <-metricsCh:
+		metricsStopped = true
+		if err != nil {
+			addErr(fmt.Errorf("metrics server: %w", err))
+		}
+		// A clean metrics shutdown happens during signal-driven shutdown.
+		// Either way the runner observes the same cancellation and drains.
+		cancel()
+	case err := <-runnerErr:
+		runnerStopped = true
+		addErr(err)
+		// Stop metrics and pool polling if the runner exits on its own.
+		cancel()
+	}
+
+	if !runnerStopped {
+		runnerStopped = true
+		addErr(<-runnerErr)
+	}
+	if metricsEnabled && !metricsStopped {
+		metricsStopped = true
+		addErr(<-metricsCh)
+	}
+	if runErr != nil {
+		return runErr
+	}
+	logger.Info("worker stopped")
+	return nil
 }
 
 // workerID identifies this process in jobs.locked_by.

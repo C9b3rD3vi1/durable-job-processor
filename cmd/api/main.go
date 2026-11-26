@@ -98,8 +98,11 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	metricsEnabled := cfg.MetricsEnabled
 	metricsErr := make(chan error, 1)
-	if cfg.MetricsEnabled {
+	var metricsCh <-chan error
+	if metricsEnabled {
+		metricsCh = metricsErr
 		go func() {
 			metricsErr <- observability.ServeMetrics(ctx, cfg.MetricsAddr, cfg.MetricsToken, metrics)
 		}()
@@ -126,37 +129,64 @@ func run() error {
 	}()
 
 	metricsStopped := false
+	serverStopped := false
+	var runErr error
+	addErr := func(err error) {
+		if err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}
+
 	select {
 	case err := <-serverErr:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		serverStopped = true
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			addErr(fmt.Errorf("serve HTTP: %w", err))
 		}
-		return fmt.Errorf("serve HTTP: %w", err)
-	case err := <-metricsErr:
-		if err != nil {
-			return fmt.Errorf("metrics server: %w", err)
-		}
-		// ServeMetrics returns nil only after ctx is cancelled. Fall through to
-		// the normal shutdown path instead of wrapping a nil error.
+		stop()
+	case err := <-metricsCh:
 		metricsStopped = true
-		logger.Info("metrics listener stopped", "addr", cfg.MetricsAddr)
+		if err != nil {
+			addErr(fmt.Errorf("metrics server: %w", err))
+		}
+		stop()
 	case <-ctx.Done():
 		logger.Info("shutdown requested", "timeout", cfg.ShutdownTimeout.String())
+		stop()
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("graceful shutdown: %w", err)
+		addErr(fmt.Errorf("graceful shutdown: %w", err))
 	}
 
-	if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("serve HTTP: %w", err)
-	}
-	if cfg.MetricsEnabled && !metricsStopped {
-		if err := <-metricsErr; err != nil {
-			return fmt.Errorf("metrics server: %w", err)
+	if !serverStopped {
+		select {
+		case err := <-serverErr:
+			serverStopped = true
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				addErr(fmt.Errorf("serve HTTP: %w", err))
+			}
+		case <-shutdownCtx.Done():
+			addErr(fmt.Errorf("wait for HTTP server: %w", shutdownCtx.Err()))
 		}
+	}
+	if metricsEnabled && !metricsStopped {
+		select {
+		case err := <-metricsCh:
+			metricsStopped = true
+			if err != nil {
+				addErr(fmt.Errorf("metrics server: %w", err))
+			} else {
+				logger.Info("metrics listener stopped", "addr", cfg.MetricsAddr)
+			}
+		case <-shutdownCtx.Done():
+			addErr(fmt.Errorf("wait for metrics server: %w", shutdownCtx.Err()))
+		}
+	}
+	if runErr != nil {
+		return runErr
 	}
 	logger.Info("api stopped")
 	return nil

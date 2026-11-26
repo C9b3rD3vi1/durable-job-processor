@@ -200,14 +200,33 @@ func (m *Metrics) getOrCreate(name string, kind metricKind) *metric {
 	return mt
 }
 
+// metricForKind returns mt only when its registered kind is one of kinds.
+// Mismatched calls are ignored instead of creating a sample shape that render
+// cannot safely expose.
+func (m *Metrics) metricForKind(name string, kinds ...metricKind) *metric {
+	if len(kinds) == 0 {
+		return nil
+	}
+	mt := m.getOrCreate(name, kinds[0])
+	if mt == nil {
+		return nil
+	}
+	for _, kind := range kinds {
+		if mt.def.kind == kind {
+			return mt
+		}
+	}
+	return nil
+}
+
 // Inc adds one to a counter or gauge.
 func (m *Metrics) Inc(name string, labels ...Label) {
 	m.Add(name, 1, labels...)
 }
 
-// Add adds value to a counter or gauge.
+// Add adds value to a counter or gauge. Calls on histogram names are ignored.
 func (m *Metrics) Add(name string, value float64, labels ...Label) {
-	mt := m.getOrCreate(name, kindCounter)
+	mt := m.metricForKind(name, kindCounter, kindGauge)
 	if mt == nil {
 		return
 	}
@@ -217,9 +236,10 @@ func (m *Metrics) Add(name string, value float64, labels ...Label) {
 	mt.mu.Unlock()
 }
 
-// Set replaces the value of a gauge.
+// Set replaces the value of a gauge. Calls on counter or histogram names are
+// ignored.
 func (m *Metrics) Set(name string, value float64, labels ...Label) {
-	mt := m.getOrCreate(name, kindGauge)
+	mt := m.metricForKind(name, kindGauge)
 	if mt == nil {
 		return
 	}
@@ -229,9 +249,10 @@ func (m *Metrics) Set(name string, value float64, labels ...Label) {
 	mt.mu.Unlock()
 }
 
-// Observe records one value in a histogram.
+// Observe records one value in a histogram. Calls on counter or gauge names
+// are ignored.
 func (m *Metrics) Observe(name string, value float64, labels ...Label) {
-	mt := m.getOrCreate(name, kindHistogram)
+	mt := m.metricForKind(name, kindHistogram)
 	if mt == nil {
 		return
 	}
