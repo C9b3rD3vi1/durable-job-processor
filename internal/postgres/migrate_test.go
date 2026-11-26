@@ -5,6 +5,22 @@ import (
 	"testing/fstest"
 )
 
+func TestMigrationChecksumIsStableAndContentSensitive(t *testing.T) {
+	first := migrationChecksum([]byte("SELECT 1"))
+	again := migrationChecksum([]byte("SELECT 1"))
+	changed := migrationChecksum([]byte("SELECT 2"))
+
+	if first != again {
+		t.Fatalf("migrationChecksum() is not stable: %q != %q", first, again)
+	}
+	if first == changed {
+		t.Fatal("migrationChecksum() did not change with content")
+	}
+	if len(first) != 64 {
+		t.Fatalf("len(migrationChecksum()) = %d, want 64 hex characters", len(first))
+	}
+}
+
 func TestLoadMigrationsOrdersByVersion(t *testing.T) {
 	fsys := fstest.MapFS{
 		"0003_add_index.sql":   {Data: []byte("SELECT 3")},

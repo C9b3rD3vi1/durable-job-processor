@@ -89,6 +89,11 @@ func (r *JobRepository) QueueStats(ctx context.Context) (queue.Stats, error) {
 }
 
 // CompleteJob records success only when the caller still holds the lease.
+// Terminal writes (complete, fail and cancel-running) intentionally do not also
+// require an unexpired lease: the lease token already fences stale owners, and
+// accepting a late result avoids re-executing work that finished just after the
+// lease deadline. Heartbeat is stricter because it is the signal the worker uses
+// to retain ownership; once heartbeat fails, recovery owns abandoned leases.
 func (r *JobRepository) CompleteJob(ctx context.Context, id, leaseToken uuid.UUID, result json.RawMessage) (bool, error) {
 	if id == uuid.Nil || leaseToken == uuid.Nil {
 		return false, fmt.Errorf("%w: job id and lease token are required", domain.ErrInvalidArgument)

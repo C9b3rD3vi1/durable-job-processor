@@ -2,12 +2,16 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,8 +24,10 @@ type migration struct {
 }
 
 // Migrate applies every unapplied .sql file in fsys in ascending version order.
-// It creates schema_migrations automatically and holds a PostgreSQL advisory
-// lock for the duration so concurrent deploys cannot race.
+// It creates schema_migrations automatically, stores a SHA-256 checksum for each
+// newly applied file, rejects already-applied files whose contents changed, and
+// holds a PostgreSQL advisory lock for the duration so concurrent deploys
+// cannot race. Legacy rows without a checksum are accepted and backfilled.
 func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) (int, error) {
 	if pool == nil {
 		return 0, fmt.Errorf("database pool is required")
@@ -52,28 +58,53 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) (int, error) {
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    bigint PRIMARY KEY,
 			name       text NOT NULL,
+			checksum   text NOT NULL DEFAULT '',
 			applied_at timestamptz NOT NULL DEFAULT now()
 		)
 	`); err != nil {
 		return 0, fmt.Errorf("create schema_migrations: %w", err)
 	}
+	// Databases created before checksum tracking keep their version history;
+	// add the column with an empty sentinel so legacy rows remain valid.
+	if _, err := conn.Exec(ctx,
+		`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum text NOT NULL DEFAULT ''`,
+	); err != nil {
+		return 0, fmt.Errorf("add schema_migrations checksum: %w", err)
+	}
 
 	appliedCount := 0
 	for _, m := range migrations {
-		var applied bool
-		if err := conn.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`,
-			m.version,
-		).Scan(&applied); err != nil {
-			return appliedCount, fmt.Errorf("check migration %s: %w", m.name, err)
-		}
-		if applied {
-			continue
-		}
-
 		sqlBytes, err := fs.ReadFile(fsys, m.name)
 		if err != nil {
 			return appliedCount, fmt.Errorf("read migration %s: %w", m.name, err)
+		}
+		checksum := migrationChecksum(sqlBytes)
+
+		var storedChecksum string
+		err = conn.QueryRow(ctx,
+			`SELECT checksum FROM schema_migrations WHERE version = $1`,
+			m.version,
+		).Scan(&storedChecksum)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return appliedCount, fmt.Errorf("check migration %s: %w", m.name, err)
+		}
+		if err == nil {
+			if storedChecksum != "" && storedChecksum != checksum {
+				return appliedCount, fmt.Errorf(
+					"migration %s changed since it was applied: stored checksum %q, current %q",
+					m.name, storedChecksum, checksum,
+				)
+			}
+			if storedChecksum == "" {
+				// Backfill legacy rows so the next run also detects drift.
+				if _, err := conn.Exec(ctx,
+					`UPDATE schema_migrations SET checksum = $2 WHERE version = $1`,
+					m.version, checksum,
+				); err != nil {
+					return appliedCount, fmt.Errorf("backfill checksum for %s: %w", m.name, err)
+				}
+			}
+			continue
 		}
 
 		tx, err := conn.Begin(ctx)
@@ -86,8 +117,8 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) (int, error) {
 			return appliedCount, fmt.Errorf("apply migration %s: %w", m.name, err)
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`,
-			m.version, m.name,
+			`INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)`,
+			m.version, m.name, checksum,
 		); err != nil {
 			_ = tx.Rollback(ctx)
 			return appliedCount, fmt.Errorf("record migration %s: %w", m.name, err)
@@ -99,6 +130,11 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) (int, error) {
 	}
 
 	return appliedCount, nil
+}
+
+func migrationChecksum(sql []byte) string {
+	sum := sha256.Sum256(sql)
+	return hex.EncodeToString(sum[:])
 }
 
 func loadMigrations(fsys fs.FS) ([]migration, error) {
