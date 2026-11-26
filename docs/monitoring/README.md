@@ -83,6 +83,10 @@ contains exactly these panels:
 | Database pool usage | `max(db_pool_in_use / clamp_min(db_pool_max_conns, 1))` |
 | Job wait time | `histogram_quantile(0.95, sum by (le) (rate(job_wait_duration_seconds_bucket[15m])))` |
 | Active handlers | `sum(worker_active_count)` |
+| Heartbeat failures | `sum(rate(worker_heartbeat_failures_total[10m]))` |
+| Expired lease outcomes | `sum by (outcome) (increase(worker_expired_leases_total[30m]))` |
+| Rate limits | `sum by (scope) (rate(api_rate_limited_total[5m]))` and `sum(rate(api_rate_limiter_unavailable_total[5m]))` |
+| Cancellations | `sum(rate(jobs_cancelled_total[5m]))` |
 
 Metrics are process-local, so scrape every replica and aggregate explicitly.
 Queue depth and age gauges are computed from one shared PostgreSQL view but
@@ -95,9 +99,6 @@ dashboard panels:
 
 ```promql
 sum by (job_type, class) (rate(jobs_failed_total[5m]))
-sum(increase(jobs_cancelled_total[15m]))
-sum by (scope) (rate(api_rate_limited_total[5m]))
-sum by (scope) (rate(api_rate_limiter_unavailable_total[5m]))
 histogram_quantile(0.95, sum by (le) (rate(job_execution_duration_seconds_bucket[5m])))
 histogram_quantile(0.95, sum by (le) (rate(api_http_request_duration_seconds_bucket[5m])))
 sum(db_pool_wait_count)

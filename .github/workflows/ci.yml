@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   go:
@@ -40,7 +39,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          unformatted="$(gofmt -l cmd internal tests)"
+          unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
             echo "Unformatted files:"
             echo "$unformatted"
@@ -64,6 +63,9 @@ jobs:
   containers:
     name: Build and publish container images
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:

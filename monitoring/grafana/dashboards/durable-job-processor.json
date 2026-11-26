@@ -142,6 +142,75 @@
       ],
       "title": "Active handlers",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 9,
+      "options": {},
+      "targets": [
+        {
+          "expr": "sum(rate(worker_heartbeat_failures_total[10m]))",
+          "legendFormat": "heartbeat failures",
+          "refId": "A"
+        }
+      ],
+      "title": "Heartbeat failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 10,
+      "options": {},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(worker_expired_leases_total[30m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Expired lease outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "id": 11,
+      "options": {},
+      "targets": [
+        {
+          "expr": "sum by (scope) (rate(api_rate_limited_total[5m]))",
+          "legendFormat": "rejected {{scope}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(api_rate_limiter_unavailable_total[5m]))",
+          "legendFormat": "limiter unavailable",
+          "refId": "B"
+        }
+      ],
+      "title": "Rate limits",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "id": 12,
+      "options": {},
+      "targets": [
+        {
+          "expr": "sum(rate(jobs_cancelled_total[5m]))",
+          "legendFormat": "cancelled",
+          "refId": "A"
+        }
+      ],
+      "title": "Cancellations",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

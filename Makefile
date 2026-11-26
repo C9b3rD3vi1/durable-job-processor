@@ -14,7 +14,7 @@ fmt: ## Format Go source
 	$(GO) fmt ./...
 
 fmt-check: ## Verify Go source is formatted
-	@unformatted="$$(gofmt -l cmd internal tests)"; \
+	@unformatted="$$(gofmt -l .)"; \
 	if [ -n "$$unformatted" ]; then \
 		echo "Unformatted files:"; \
 		echo "$$unformatted"; \
